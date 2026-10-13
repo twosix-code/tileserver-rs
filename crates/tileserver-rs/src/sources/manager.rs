@@ -614,6 +614,49 @@ impl SourceManager {
 
         if let Some(cog) = source.as_ref().as_any().downcast_ref::<CogSource>() {
             let resample = resampling.unwrap_or(cog.resampling());
+            // Identity raster cache: canonical /data/{source}/{z}/{x}/{y}.png
+            // requests (no `?resampling=` override, standard 256 px tile) consult
+            // the global [cache], mirroring get_tile() for vector sources. The
+            // COG warp + PNG encode is the expensive part of every raster
+            // request; caching it makes [cache] meaningful for raster sources.
+            // Explicit overrides and non-standard tile sizes bypass the cache:
+            // the key has no slot for them (rare paths; correctness first).
+            if resampling.is_none() && tile_size == 256 && self.global_cache.is_some() {
+                let cache = self.global_cache.as_ref().expect("checked above");
+                let key = crate::cache::TileCacheKey {
+                    source_id: id.into(),
+                    z,
+                    x,
+                    y,
+                    encoding: crate::sources::TileCompression::None,
+                    filter: 0, // raster sources take no CEL presets (vector-only)
+                };
+                if let Some(cached) = cache.get(&key).await {
+                    crate::metrics::cache_hit_recorded(id);
+                    return Ok(Some(cached));
+                }
+                crate::metrics::cache_miss_recorded(id);
+                let started = std::time::Instant::now();
+                let fetch = cog.get_tile_with_resampling(z, x, y, tile_size, resample).await;
+                let (outcome, bytes) = match &fetch {
+                    Ok(Some(t)) => (crate::metrics::TileOutcome::Miss, t.data.len()),
+                    Ok(None) => (crate::metrics::TileOutcome::NotFound, 0),
+                    Err(_) => (crate::metrics::TileOutcome::Error, 0),
+                };
+                crate::metrics::tile_request_recorded(crate::metrics::TileEvent {
+                    source: id,
+                    format: source.format(),
+                    z,
+                    bytes,
+                    duration: started.elapsed(),
+                    outcome,
+                });
+                let tile = fetch?;
+                if let Some(ref tile) = tile {
+                    cache.insert(key, tile.clone()).await;
+                }
+                return Ok(tile);
+            }
             cog.get_tile_with_resampling(z, x, y, tile_size, resample)
                 .await
         } else {
@@ -637,8 +680,14 @@ impl SourceManager {
             }
             #[cfg(not(feature = "postgres"))]
             let _ = query_params;
-            let tile = source.get_tile(z, x, y).await?;
-            self.apply_preset(id, tile)
+            // Generic tail: route through the manager's cached get_tile().
+            // With the raster feature every /data request lands here (vector
+            // and STAC sources included), and the previous direct
+            // source.get_tile() call bypassed the global [cache] entirely —
+            // only re-encoded variants were ever cached. get_tile() consults
+            // the cache, applies CEL presets, and records the same metrics
+            // as the non-raster path.
+            self.get_tile(id, z, x, y).await
         }
     }
 
@@ -740,6 +789,18 @@ mod tests {
                     compression: TileCompression::None,
                 }),
             }
+        }
+
+        /// Test helper: swap the tile format (metadata + tile data) to
+        /// exercise format-specific paths (e.g. Png raster sources).
+        fn with_tile_format(mut self, format: TileFormat) -> Self {
+            self.meta.format = format;
+            self.tile = self.tile.map(|t| TileData {
+                data: t.data,
+                format,
+                compression: t.compression,
+            });
+            self
         }
     }
 
@@ -927,6 +988,43 @@ mod tests {
         };
         let cached = cache.get(&key).await;
         assert!(cached.is_some());
+    }
+
+    /// Raster sources served through `get_raster_tile_with_params` (STAC,
+    /// PMTiles/MBTiles-as-raster, …) must land in the global cache via the
+    /// generic `get_tile` tail. Previously the direct `source.get_tile()`
+    /// call bypassed `[cache]` entirely for /data raster requests — only
+    /// Accept-Encoding re-encode variants were ever cached.
+    #[cfg(feature = "raster")]
+    #[tokio::test]
+    async fn raster_generic_tail_uses_global_cache() {
+        let mut map: HashMap<String, Arc<dyn TileSource>> = HashMap::new();
+        map.insert(
+            "png-src".to_string(),
+            Arc::new(MockSource::new("png-src").with_tile_format(TileFormat::Png))
+                as Arc<dyn TileSource>,
+        );
+        let cache = Arc::new(crate::cache::TileCache::new(1, 3600));
+        let mgr = SourceManager::from_sources(map).with_cache(cache.clone());
+
+        let tile = mgr
+            .get_raster_tile_with_params("png-src", 3, 4, 5, 256, None, None)
+            .await
+            .expect("tile fetch");
+        assert!(tile.is_some());
+
+        let key = crate::cache::TileCacheKey {
+            source_id: "png-src".into(),
+            z: 3,
+            x: 4,
+            y: 5,
+            encoding: crate::sources::TileCompression::None,
+            filter: 0,
+        };
+        assert!(
+            cache.get(&key).await.is_some(),
+            "identity raster tile must be inserted into the global cache"
+        );
     }
 
     #[tokio::test]
