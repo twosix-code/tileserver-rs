@@ -34,7 +34,7 @@ use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use gdal::Dataset;
+use gdal::{Dataset, DatasetOptions};
 use moka::future::Cache;
 use tokio::sync::Mutex;
 
@@ -83,6 +83,49 @@ impl DatasetCache {
 
         let arc = Arc::new(Mutex::new(dataset));
         self.inner.insert(path.to_string(), arc.clone()).await;
+        Ok(arc)
+    }
+
+    /// Fetch a cached [`Dataset`] for `key`, opened with `open_options` on miss.
+    ///
+    /// Used by `CogSource` to cache overview-level-opened datasets keyed by
+    /// (path, overview_level) — mirroring rio-tiler's per-level reader cache.
+    /// Each overview level is opened **at most once per process**; the cached
+    /// handle is then reused for every tile request that needs that level.
+    /// The key must encode the open options (e.g. `{path}#ovr{level}`) so that
+    /// different options don't collide in the cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TileServerError::RasterError`] if `Dataset::open_ex` fails or
+    /// the blocking task panics. Failed opens do not populate the cache.
+    pub async fn get_or_open_with_options(
+        &self,
+        key: &str,
+        path: &str,
+        open_options: &[&str],
+    ) -> Result<CachedDataset> {
+        if let Some(cached) = self.inner.get(key).await {
+            return Ok(cached);
+        }
+        let path_owned = path.to_string();
+        let options_owned: Vec<String> = open_options.iter().map(|s| s.to_string()).collect();
+        let dataset = tokio::task::spawn_blocking(move || {
+            let options_refs: Vec<&str> = options_owned.iter().map(String::as_str).collect();
+            Dataset::open_ex(
+                Path::new(&path_owned),
+                DatasetOptions {
+                    open_options: Some(&options_refs),
+                    ..DatasetOptions::default()
+                },
+            )
+            .map_err(|e| TileServerError::RasterError(format!("failed to open dataset: {e}")))
+        })
+        .await
+        .map_err(|e| TileServerError::RasterError(format!("task failed: {e}")))??;
+
+        let arc = Arc::new(Mutex::new(dataset));
+        self.inner.insert(key.to_string(), arc.clone()).await;
         Ok(arc)
     }
 
