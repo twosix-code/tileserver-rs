@@ -621,8 +621,10 @@ impl SourceManager {
             // request; caching it makes [cache] meaningful for raster sources.
             // Explicit overrides and non-standard tile sizes bypass the cache:
             // the key has no slot for them (rare paths; correctness first).
-            if resampling.is_none() && tile_size == 256 && self.global_cache.is_some() {
-                let cache = self.global_cache.as_ref().expect("checked above");
+            if resampling.is_none()
+                && tile_size == 256
+                && let Some(cache) = self.global_cache.as_ref()
+            {
                 let key = crate::cache::TileCacheKey {
                     source_id: id.into(),
                     z,
@@ -637,7 +639,9 @@ impl SourceManager {
                 }
                 crate::metrics::cache_miss_recorded(id);
                 let started = std::time::Instant::now();
-                let fetch = cog.get_tile_with_resampling(z, x, y, tile_size, resample).await;
+                let fetch = cog
+                    .get_tile_with_resampling(z, x, y, tile_size, resample)
+                    .await;
                 let (outcome, bytes) = match &fetch {
                     Ok(Some(t)) => (crate::metrics::TileOutcome::Miss, t.data.len()),
                     Ok(None) => (crate::metrics::TileOutcome::NotFound, 0),
