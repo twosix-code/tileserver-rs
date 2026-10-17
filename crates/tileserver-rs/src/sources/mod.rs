@@ -220,6 +220,32 @@ pub struct TileData {
     pub compression: TileCompression,
 }
 
+/// Convert a remote asset URL into a path GDAL can range-read.
+///
+/// A bare `https://…/TCI.tif` makes GDAL route through its curl→/vsimem
+/// full-download shim (whole file per open); the `/vsicurl/` VSI prefix
+/// switches it to HTTP range requests so only the COG header + requested
+/// overview bands are fetched. Non-HTTP paths pass through unchanged.
+///
+/// Idempotent: a path that already carries a VSI prefix (`/vsicurl/`,
+/// `/vsis3/`, `/vsigs/`, `/vsiaz/`, …) is returned unchanged, so a config
+/// author who wrote the prefix by hand does not end up double-prefixed.
+///
+/// Lives here (not in the feature-gated `stac` module) so `cog`/`dem`
+/// sources can normalise paths without pulling in the `stac` feature.
+#[must_use]
+pub fn to_gdal_cog_path(href: &str) -> String {
+    if href.starts_with("/vsi") {
+        href.to_string()
+    } else if href.starts_with("http://") || href.starts_with("https://") {
+        format!("/vsicurl/{href}")
+    } else if let Some(rest) = href.strip_prefix("s3://") {
+        format!("/vsis3/{rest}")
+    } else {
+        href.to_string()
+    }
+}
+
 /// Detect if raw tile data is in MLT (MapLibre Tile) format.
 ///
 /// MLT tiles start with a 7-bit varint size followed by tag byte `0x01`.
@@ -302,6 +328,49 @@ pub trait TileSource: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_to_gdal_cog_path_https() {
+        let result = to_gdal_cog_path("https://example.com/cog.tif");
+        assert_eq!(result, "/vsicurl/https://example.com/cog.tif");
+    }
+
+    #[test]
+    fn test_to_gdal_cog_path_http() {
+        let result = to_gdal_cog_path("http://example.com/cog.tif");
+        assert_eq!(result, "/vsicurl/http://example.com/cog.tif");
+    }
+
+    #[test]
+    fn test_to_gdal_cog_path_s3() {
+        let result = to_gdal_cog_path("s3://bucket/path/cog.tif");
+        assert_eq!(result, "/vsis3/bucket/path/cog.tif");
+    }
+
+    #[test]
+    fn test_to_gdal_cog_path_local_passthrough() {
+        let result = to_gdal_cog_path("/local/path/cog.tif");
+        assert_eq!(result, "/local/path/cog.tif");
+    }
+
+    #[test]
+    fn test_to_gdal_cog_path_relative_passthrough() {
+        let result = to_gdal_cog_path("relative/cog.tif");
+        assert_eq!(result, "relative/cog.tif");
+    }
+
+    #[test]
+    fn test_to_gdal_cog_path_already_vsicurl_idempotent() {
+        // A config that spells the prefix out by hand must NOT be double-prefixed.
+        let result = to_gdal_cog_path("/vsicurl/https://example.com/cog.tif");
+        assert_eq!(result, "/vsicurl/https://example.com/cog.tif");
+    }
+
+    #[test]
+    fn test_to_gdal_cog_path_already_vsis3_idempotent() {
+        let result = to_gdal_cog_path("/vsis3/bucket/cog.tif");
+        assert_eq!(result, "/vsis3/bucket/cog.tif");
+    }
 
     #[test]
     fn test_tile_format_mlt_content_type() {
