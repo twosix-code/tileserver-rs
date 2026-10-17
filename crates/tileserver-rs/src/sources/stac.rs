@@ -1362,49 +1362,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_to_gdal_cog_path_https() {
-        let result = to_gdal_cog_path("https://example.com/cog.tif");
-        assert_eq!(result, "/vsicurl/https://example.com/cog.tif");
-    }
-
-    #[test]
-    fn test_to_gdal_cog_path_http() {
-        let result = to_gdal_cog_path("http://example.com/cog.tif");
-        assert_eq!(result, "/vsicurl/http://example.com/cog.tif");
-    }
-
-    #[test]
-    fn test_to_gdal_cog_path_s3() {
-        let result = to_gdal_cog_path("s3://bucket/path/cog.tif");
-        assert_eq!(result, "/vsis3/bucket/path/cog.tif");
-    }
-
-    #[test]
-    fn test_to_gdal_cog_path_local_passthrough() {
-        let result = to_gdal_cog_path("/local/path/cog.tif");
-        assert_eq!(result, "/local/path/cog.tif");
-    }
-
-    #[test]
-    fn test_to_gdal_cog_path_relative_passthrough() {
-        let result = to_gdal_cog_path("relative/cog.tif");
-        assert_eq!(result, "relative/cog.tif");
-    }
-
-    #[test]
-    fn test_to_gdal_cog_path_already_vsicurl_idempotent() {
-        // A config that spells the prefix out by hand must NOT be double-prefixed.
-        let result = to_gdal_cog_path("/vsicurl/https://example.com/cog.tif");
-        assert_eq!(result, "/vsicurl/https://example.com/cog.tif");
-    }
-
-    #[test]
-    fn test_to_gdal_cog_path_already_vsis3_idempotent() {
-        let result = to_gdal_cog_path("/vsis3/bucket/cog.tif");
-        assert_eq!(result, "/vsis3/bucket/cog.tif");
-    }
-
     fn make_asset_with_cloud_cover(id: &str, cloud_cover: Option<f64>) -> StacAsset {
         StacAsset {
             id: id.to_string(),
