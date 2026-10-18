@@ -273,7 +273,14 @@ impl DemSource {
         // shim instead of `/vsicurl/` range reads. Idempotent, so an explicit
         // `/vsicurl/` prefix in config passes through unchanged.
         let path = crate::sources::to_gdal_cog_path(&config.path);
-        dataset_cache::global().get_or_open(&path).await
+        // The cache now stores a *pool* per key. A DEM source holds one shared
+        // handle for its lifetime (as before), so borrow one from the pool and
+        // keep it. The pool keeps the handle open and counted against the byte
+        // budget; this source's `Arc<Mutex<Dataset>>` is a second reference to
+        // the same `Dataset` via the pool's idle list.
+        let pool = dataset_cache::global().get_or_open(&path).await?;
+        let handle = pool.acquire_arc().await?;
+        Ok(Arc::new(Mutex::new(handle.into_dataset())))
     }
 
     /// Render one tile, exposed directly so the manager can request a
