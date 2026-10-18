@@ -2,7 +2,6 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use gdal::DatasetOptions;
 use gdal::raster::{Buffer, ColorInterpretation, ResampleAlg};
 use gdal::spatial_ref::SpatialRef;
 use gdal::{Dataset, DriverManager};
@@ -58,7 +57,12 @@ impl CogSource {
         // has been opened before. This saves the 10-50ms HTTP+IFD parse
         // cost that would otherwise be paid on every STAC-mosaic asset
         // render.  See `dataset_cache` for eviction policy.
-        let dataset = dataset_cache::global().get_or_open(&path).await?;
+        //
+        // The cache stores a *pool* per key; this source keeps one shared base
+        // handle for its lifetime, so borrow one from the pool and hold it.
+        let pool = dataset_cache::global().get_or_open(&path).await?;
+        let base_handle = pool.acquire_arc().await?;
+        let dataset: Arc<Mutex<Dataset>> = Arc::new(Mutex::new(base_handle.into_dataset()));
 
         let dataset_for_inspect = Arc::clone(&dataset);
         let (band_count, bounds, overview_resolutions) = tokio::task::spawn_blocking(move || {
@@ -135,6 +139,33 @@ impl CogSource {
         let path = self.path.clone();
         let dataset = self.dataset.clone();
 
+        // `overview_index` of 0 means "use the full-resolution base", which is
+        // already the cached dataset.  Any other value means "read from overview
+        // level `overview_index - 1`", which requires re-opening the source with
+        // GDAL's `OVERVIEW_LEVEL` open option.
+        //
+        // Overview-level-opened datasets are **cached per (path, level)** in the
+        // process-global `dataset_cache` (mirroring rio-tiler's per-level reader
+        // cache).  Each level keeps a *pool* of handles, not one shared handle:
+        // concurrent tiles at the same level each borrow a different handle and
+        // render in parallel (a single `Arc<Mutex<Dataset>>` serialised them).
+        // This keeps the cached-open win without the concurrency regression.
+        // The cache lookup itself is async and runs on the async runtime, before
+        // the blocking render is spawned.
+        let render_pool: Option<Arc<crate::sources::dataset_cache::Pool>> =
+            if overview_index == 0 {
+                None
+            } else {
+                let ovr_level = overview_index - 1;
+                let ovr_arg = format!("OVERVIEW_LEVEL={ovr_level}");
+                let key = format!("{path}#ovr{ovr_level}");
+                Some(
+                    crate::sources::dataset_cache::global()
+                        .get_or_open_with_options(&key, &path, &[&ovr_arg])
+                        .await?,
+                )
+            };
+
         let png_data = tokio::task::spawn_blocking(move || {
             let render_from = |dataset: &Dataset| {
                 render_tile_from_dataset(
@@ -150,36 +181,20 @@ impl CogSource {
                 )
             };
 
-            // `overview_index` of 0 means "use the full-resolution base", which is
-            // already the cached dataset.  Any other value means "read from overview
-            // level `overview_index - 1`", which requires re-opening the source with
-            // GDAL's `OVERVIEW_LEVEL` open option.
-            //
-            // We do NOT cache the overview-level-opened dataset — each tile request
-            // may pick a different overview level, so a cache keyed by (path, idx)
-            // would grow unboundedly per-zoom.  The cost is a single `Dataset::open_ex`
-            // per tile (~1-5ms on warm OS page cache), recovered many-times-over by
-            // not reading the full-res raster.
-            if overview_index == 0 {
-                let dataset = dataset.blocking_lock();
-                render_from(&dataset)
-            } else {
-                let ovr_level = overview_index - 1;
-                let ovr_arg = format!("OVERVIEW_LEVEL={ovr_level}");
-                let open_options: [&str; 1] = [&ovr_arg];
-                let dataset = Dataset::open_ex(
-                    &path,
-                    DatasetOptions {
-                        open_options: Some(&open_options),
-                        ..DatasetOptions::default()
-                    },
-                )
-                .map_err(|e| {
-                    TileServerError::RasterError(format!(
-                        "failed to open {path} with OVERVIEW_LEVEL={ovr_level}: {e}"
-                    ))
-                })?;
-                render_from(&dataset)
+            match render_pool {
+                // Overview level: borrow a handle from the pool for the
+                // duration of the render, then return it. Borrowing (and
+                // returning) inside the blocking task is what lets concurrent
+                // renders at this level proceed in parallel.
+                Some(pool) => {
+                    let handle = pool.acquire_blocking()?;
+                    render_from(handle.dataset())
+                }
+                // Base level: the single shared handle, as before.
+                None => {
+                    let dataset = dataset.blocking_lock();
+                    render_from(&dataset)
+                }
             }
         })
         .await
