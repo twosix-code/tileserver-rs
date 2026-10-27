@@ -275,9 +275,9 @@ impl DemSource {
         let path = crate::sources::to_gdal_cog_path(&config.path);
         // The cache now stores a *pool* per key. A DEM source holds one shared
         // handle for its lifetime (as before), so borrow one from the pool and
-        // keep it. The pool keeps the handle open and counted against the byte
-        // budget; this source's `Arc<Mutex<Dataset>>` is a second reference to
-        // the same `Dataset` via the pool's idle list.
+        // keep it. `into_dataset` detaches the handle from the pool: the pool no
+        // longer keeps or counts it, and this source owns the `Dataset`
+        // directly (there is no second reference through an idle list).
         let pool = dataset_cache::global().get_or_open(&path).await?;
         let handle = pool.acquire_arc().await?;
         Ok(Arc::new(Mutex::new(handle.into_dataset())))

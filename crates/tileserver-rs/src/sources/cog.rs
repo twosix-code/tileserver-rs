@@ -60,6 +60,7 @@ impl CogSource {
         //
         // The cache stores a *pool* per key; this source keeps one shared base
         // handle for its lifetime, so borrow one from the pool and hold it.
+        // `into_dataset` detaches it from the pool (releasing the pool slot).
         let pool = dataset_cache::global().get_or_open(&path).await?;
         let base_handle = pool.acquire_arc().await?;
         let dataset: Arc<Mutex<Dataset>> = Arc::new(Mutex::new(base_handle.into_dataset()));
@@ -152,19 +153,18 @@ impl CogSource {
         // This keeps the cached-open win without the concurrency regression.
         // The cache lookup itself is async and runs on the async runtime, before
         // the blocking render is spawned.
-        let render_pool: Option<Arc<crate::sources::dataset_cache::Pool>> =
-            if overview_index == 0 {
-                None
-            } else {
-                let ovr_level = overview_index - 1;
-                let ovr_arg = format!("OVERVIEW_LEVEL={ovr_level}");
-                let key = format!("{path}#ovr{ovr_level}");
-                Some(
-                    crate::sources::dataset_cache::global()
-                        .get_or_open_with_options(&key, &path, &[&ovr_arg])
-                        .await?,
-                )
-            };
+        let render_pool: Option<Arc<dataset_cache::Pool>> = if overview_index == 0 {
+            None
+        } else {
+            let ovr_level = overview_index - 1;
+            let ovr_arg = format!("OVERVIEW_LEVEL={ovr_level}");
+            let key = format!("{path}#ovr{ovr_level}");
+            Some(
+                dataset_cache::global()
+                    .get_or_open_with_options(&key, &path, &[&ovr_arg])
+                    .await?,
+            )
+        };
 
         let png_data = tokio::task::spawn_blocking(move || {
             let render_from = |dataset: &Dataset| {
