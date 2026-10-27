@@ -802,4 +802,130 @@ mod tests {
             );
         }
     }
+
+    // ---- Overview-path get_tile (the `{path}#ovr{n}` cache branch) ----
+
+    /// Write a real on-disk RGB GeoTIFF (EPSG:3857, uint8) that has **built
+    /// overviews**, so `compute_overview_resolutions` reports more than one
+    /// level and a low-zoom tile actually selects the `{path}#ovr{n}` path.
+    ///
+    /// Returns the file path. The dataset is closed when it drops (before the
+    /// caller re-opens it by path, which it must — GDAL overview levels are
+    /// only reachable by re-opening with `OVERVIEW_LEVEL=N`, and in-memory
+    /// datasets can't be re-opened).
+    fn write_overviewed_cog(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let driver = DriverManager::get_driver_by_name("GTiff").unwrap();
+        // 512×512 so a 4×/16× overview chain is legal (GDAL won't build a
+        // level below ~2 pixels).
+        let size = 512usize;
+        let path = dir.join(name);
+        {
+            let mut ds = driver
+                .create_with_band_type::<u8, _>(&path, size, size, 3)
+                .unwrap();
+            // Full-world EPSG:3857 geotransform, like TEST_GT_FULL.
+            let px = 2.0 * WEB_MERCATOR_EXTENT / size as f64;
+            ds.set_geo_transform(&[-WEB_MERCATOR_EXTENT, px, 0.0, WEB_MERCATOR_EXTENT, 0.0, -px])
+                .unwrap();
+            let srs = SpatialRef::from_epsg(3857).unwrap();
+            ds.set_spatial_ref(&srs).unwrap();
+            for band in 1..=3u8 {
+                let mut b = ds.rasterband(band as usize).unwrap();
+                let data = vec![128u8; size * size];
+                let mut buffer = Buffer::new((size, size), data);
+                b.write((0, 0), (size, size), &mut buffer).unwrap();
+            }
+            // Build internal overviews so `OVERVIEW_LEVEL` opens are legal.
+            // `build_overviews` is on `Dataset` (`&mut self`): GDAL builds the
+            // pyramid for the given bands at the given decimation factors.
+            ds.build_overviews("NEAREST", &[2, 4, 8, 16, 32, 64, 128, 256], &[1, 2, 3])
+                .unwrap();
+        } // dataset dropped -> file flushed and closed
+        path
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial]
+    async fn get_tile_at_overview_level_uses_the_overview_pool() {
+        // End-to-end regression for the overview branch of
+        // `get_tile_with_resampling`: a real COG with overviews, rendered at a
+        // low zoom, must route through the `{path}#ovr{n}` pool rather than the
+        // base handle. The pool internals are covered separately; this guards
+        // the *plumbing* from `CogSource` down through the cache key. It is
+        // `#[serial]` because it asserts against the process-global cache.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_overviewed_cog(dir.path(), "overviewed.tif");
+        let p = path.to_string_lossy().to_string();
+        let config = SourceConfig {
+            id: "ovr".to_string(),
+            source_type: crate::config::SourceType::Cog,
+            path: p.clone(),
+            name: None,
+            attribution: None,
+            description: None,
+            resampling: None,
+            layer_name: None,
+            geometry_column: None,
+            query: None,
+            minzoom: None,
+            maxzoom: None,
+            serve_as: None,
+            colormap: None,
+            options: None,
+            collection: None,
+            asset_role: "data".to_string(),
+            dynamic: false,
+            max_items: 500,
+            stac_bbox: None,
+            pixel_selection: crate::config::PixelSelectionMethod::First,
+            tile_path_template: None,
+            tms: false,
+            #[cfg(feature = "dem")]
+            input_source: None,
+            #[cfg(feature = "dem")]
+            dem_encoding: crate::config::DemEncoding::Terrarium,
+            #[cfg(feature = "dem")]
+            dem_scale: None,
+            #[cfg(feature = "dem")]
+            dem_offset: None,
+            #[cfg(feature = "dem")]
+            dem_band: 1,
+            #[cfg(feature = "dem")]
+            dem_nodata_color: None,
+            filter: None,
+        };
+
+        let cog = CogSource::from_file(&config)
+            .await
+            .expect("open overviewed COG");
+        assert!(
+            cog.overview_resolutions.len() > 1,
+            "fixture must actually have overviews: got {:?}",
+            cog.overview_resolutions
+        );
+
+        // z0 world tile: the target resolution (~156543 m/px) is far coarser
+        // than the 512px base (~783 m/px), so `select_overview_level` must
+        // pick a level > 0 and the render must borrow from `{path}#ovr{n}`.
+        let tile = cog
+            .get_tile(0, 0, 0)
+            .await
+            .expect("render z0 tile")
+            .expect("tile in footprint");
+        assert!(!tile.data.is_empty(), "render must produce a PNG");
+        let img = image::load_from_memory(&tile.data).unwrap().into_rgba8();
+        assert_eq!(img.width(), 256);
+        assert_eq!(img.height(), 256);
+
+        // The overview branch must have populated a `{path}#ovr{n}` pool.
+        let cache = dataset_cache::global();
+        let ovr_key_present = (0..8).any(|level| {
+            let key = format!("{p}#ovr{level}");
+            cache.contains_key(&key)
+        });
+        assert!(
+            ovr_key_present,
+            "z0 render must go through the `{{path}}#ovr{{n}}` pool, but no overview key was cached"
+        );
+    }
 }

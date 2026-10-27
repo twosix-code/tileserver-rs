@@ -579,6 +579,13 @@ impl DatasetCache {
         self.inner.entry_count()
     }
 
+    /// Whether a specific key is currently cached (used by tests and
+    /// observability to confirm a `{path}#ovr{n}` pool was created).
+    #[must_use]
+    pub fn contains_key(&self, key: &str) -> bool {
+        self.inner.contains_key(key)
+    }
+
     /// Current total estimated weight in bytes across all pools.
     ///
     /// This is the process-wide live total the byte budget gates on, so it is
