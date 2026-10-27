@@ -146,13 +146,24 @@ impl PooledHandle {
     ///
     /// Used by sources that hold a single long-lived handle (e.g. a DEM source
     /// whose lifetime spans many tiles) rather than borrowing per render. The
-    /// handle stays counted against the byte budget via the pool's `live`
-    /// count; it is simply no longer returned to the idle list on drop.
+    /// caller now owns the handle: the pool no longer keeps it and no longer
+    /// counts it, so this releases the slot it held — `live` is decremented
+    /// and the handle's cost is returned to [`GLOBAL_LIVE_BYTES`] here, and the
+    /// waiter is woken. (Without this the slot would leak: after `limit` such
+    /// calls on one path the pool would be full with an empty idle list and the
+    /// next acquire would wait forever.)
     #[must_use]
     pub fn into_dataset(mut self) -> Dataset {
-        self.dataset
+        let dataset = self
+            .dataset
             .take()
-            .expect("PooledHandle dataset taken only on drop")
+            .expect("PooledHandle dataset taken only on drop");
+        let mut state = self.pool.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.live -= 1;
+        drop(state);
+        GLOBAL_LIVE_BYTES.fetch_sub(self.pool.cost_bytes, Ordering::AcqRel);
+        self.pool.returned.notify_one();
+        dataset
     }
 }
 
@@ -169,6 +180,23 @@ impl Drop for PooledHandle {
             drop(state);
             self.pool.returned.notify_one();
         }
+    }
+}
+
+impl Drop for Pool {
+    fn drop(&mut self) {
+        // Release the byte budget held by any handles the pool still owns at
+        // eviction time (TTL or `invalidate`). Without this the idle handles
+        // close but `live * cost_bytes` stays in `GLOBAL_LIVE_BYTES`, so the
+        // budget fills up and stays full and the server stops opening datasets
+        // after a while. `live` here counts only handles the pool still owns
+        // (borrowed handles have been moved out via `into_dataset` and already
+        // released their slot).
+        let live = self
+            .state
+            .get_mut()
+            .map_or_else(|e| e.into_inner().live, |s| s.live);
+        GLOBAL_LIVE_BYTES.fetch_sub(live as u64 * self.cost_bytes, Ordering::AcqRel);
     }
 }
 
@@ -343,18 +371,18 @@ impl Pool {
             //     borrow from). Return an error rather than deadlock.
             if state.live == 0 {
                 return Err(TileServerError::RasterError(format!(
-                    "byte budget exhausted: cannot open handle costing {} bytes (max {} bytes, {} live)",
-                    self.cost_bytes, self.max_bytes, GLOBAL_LIVE_BYTES.load(Ordering::Acquire),
+                    "byte budget exhausted for {}: cannot open handle costing {} bytes (max {} bytes, {} live)",
+                    self.path,
+                    self.cost_bytes,
+                    self.max_bytes,
+                    GLOBAL_LIVE_BYTES.load(Ordering::Acquire),
                 )));
             }
 
             // 3. At a bound: wait for a handle to be returned. `wait` releases
             //    the mutex while parked, so `drop` can take it to push the
             //    returned handle and notify us.
-            state = self
-                .returned
-                .wait(state)
-                .unwrap_or_else(|e| e.into_inner());
+            state = self.returned.wait(state).unwrap_or_else(|e| e.into_inner());
         }
     }
 
@@ -397,9 +425,13 @@ impl Pool {
                 },
             )
         }
-        .map_err(|e| TileServerError::RasterError(format!("failed to open dataset: {e}")))
+        .map_err(|e| {
+            TileServerError::RasterError(format!(
+                "failed to open {} {:?}: {e}",
+                self.path, self.open_options
+            ))
+        })
     }
-
 }
 
 pub struct DatasetCache {
@@ -443,7 +475,15 @@ impl DatasetCache {
                     // Weight is the pool's *live* byte total, read at
                     // eviction time. moka re-evaluates the weigher on
                     // maintenance, so a pool that grows is accounted for.
-                    u32::try_from(pool.weighted_bytes()).unwrap_or(u32::MAX).max(1)
+                    //
+                    // A freshly created pool weighs 0 here, so moka sees
+                    // weight 1 until the first open. That is fine: this
+                    // weigher is only an eviction hint, and `reserve_budget`
+                    // is the real bound on memory. Do not try to tune moka's
+                    // capacity for memory — tune `DEFAULT_MAX_BYTES` instead.
+                    u32::try_from(pool.weighted_bytes())
+                        .unwrap_or(u32::MAX)
+                        .max(1)
                 })
                 .time_to_live(ttl)
                 .support_invalidation_closures()
@@ -569,6 +609,7 @@ pub fn global() -> &'static DatasetCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     /// Unique-ish path in a fresh tempdir; returns (dir, path). The dir must
     /// stay alive for the path to be openable.
@@ -582,7 +623,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn miss_on_nonexistent_path_returns_error_and_does_not_cache() {
+    async fn failed_open_keeps_empty_pool() {
         let cache = DatasetCache::new(10, Duration::from_secs(60));
         let pool = cache.get_or_open("/nonexistent/path.tif").await.unwrap();
         // The pool exists but opening a handle must fail.
@@ -606,6 +647,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
     async fn acquire_release_reuses_handle() {
         let Some((_dir, p)) = tiny_gtiff("tiny.tif") else {
             return;
@@ -624,6 +666,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
     async fn concurrent_acquires_get_distinct_handles() {
         // The regression this guards: N concurrent renders at one key must not
         // serialise on a single handle. With a pool, each concurrent borrower
@@ -671,6 +714,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
     async fn weighted_size_counts_live_handles() {
         let Some((_dir, p)) = tiny_gtiff("tiny.tif") else {
             return;
@@ -731,6 +775,86 @@ mod tests {
             cache.entry_count(),
             0,
             "invalidate must drop the base key AND every {{path}}#ovr* key"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn into_dataset_releases_the_slot() {
+        // Regression: `into_dataset` used to leave `live` and
+        // `GLOBAL_LIVE_BYTES` incremented with nothing to give the slot back,
+        // so after `limit` calls on one path the pool was full with an empty
+        // idle list and the next acquire waited forever (this is what hung the
+        // `raster_sources` tests in CI).
+        //
+        // `#[serial]`: asserts against the process-global `GLOBAL_LIVE_BYTES`,
+        // which other tests also mutate, so this must not run concurrently
+        // with them.
+        let Some((_dir, p)) = tiny_gtiff("tiny.tif") else {
+            return;
+        };
+        let cache = DatasetCache::with_max_bytes(0, Duration::from_secs(60), DEFAULT_MAX_BYTES);
+        let pool = cache.get_or_open(&p).await.expect("pool");
+        let limit = pool_limit();
+        let before = GLOBAL_LIVE_BYTES.load(Ordering::Acquire);
+
+        // Take and detach more handles than the pool's limit allows to hold at
+        // once. If the slot were leaked, `live` would stay at `limit` and the
+        // `limit + 1`-th acquire would block forever.
+        for i in 0..=limit {
+            let handle = pool
+                .acquire_arc()
+                .await
+                .unwrap_or_else(|e| panic!("acquire {i} failed: {e}"));
+            let _dataset = handle.into_dataset();
+            assert_eq!(pool.live_handles(), 0, "detached handle must free its slot");
+        }
+        assert_eq!(
+            GLOBAL_LIVE_BYTES.load(Ordering::Acquire),
+            before,
+            "detached handles must release their byte cost"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn evicted_pool_releases_its_bytes() {
+        // Regression: `Pool` had no `Drop`, so an evicted pool (TTL or
+        // `invalidate`) closed its idle handles but left `live * cost_bytes`
+        // in `GLOBAL_LIVE_BYTES`. The budget then filled up and stayed full,
+        // and the server stopped opening datasets after a while.
+        //
+        // This test exercises `Drop for Pool` directly (a pool with an idle
+        // handle) so it does not depend on moka's *async* eviction timing,
+        // which is deliberately out of scope here. `#[serial]` keeps it from
+        // racing other tests that also mutate the process-global counter.
+        let Some((_dir, p)) = tiny_gtiff("tiny.tif") else {
+            return;
+        };
+        let before = GLOBAL_LIVE_BYTES.load(Ordering::Acquire);
+
+        // Build a pool directly (we own the only strong ref), open one handle,
+        // return it to idle, then drop the pool. `Drop` must release the byte
+        // cost of the idle handle it still owns.
+        let pool = Arc::new(Pool::new(p.clone(), vec![], DEFAULT_MAX_BYTES));
+        {
+            let _h = pool.acquire_arc().await.expect("acquire");
+            assert_eq!(
+                GLOBAL_LIVE_BYTES.load(Ordering::Acquire),
+                before + BASE_COST_BYTES,
+                "one live handle is counted"
+            );
+        } // handle dropped -> returned to idle, still counted
+        assert_eq!(
+            GLOBAL_LIVE_BYTES.load(Ordering::Acquire),
+            before + BASE_COST_BYTES,
+            "idle handle stays counted while the pool is alive"
+        );
+        drop(pool);
+        assert_eq!(
+            GLOBAL_LIVE_BYTES.load(Ordering::Acquire),
+            before,
+            "dropping the pool must release the idle handle's bytes"
         );
     }
 
