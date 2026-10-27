@@ -845,8 +845,20 @@ pub struct SourceConfig {
     pub asset_role: String,
     #[serde(default)]
     pub dynamic: bool,
+    /// Page size for each STAC `/search` request (the `limit` sent on the wire).
     #[serde(default = "default_stac_max_items")]
     pub max_items: usize,
+    /// Upper bound on the TOTAL number of STAC items fetched per tile across
+    /// all pages. The dynamic path follows `links[rel="next"]` until the bbox
+    /// is exhausted or this cap is hit, so dense spatial-grid collections fill
+    /// a tile completely instead of rendering only the first page's footprints.
+    ///
+    /// Defaults to 64: enough to cover a mid-zoom tile in a dense per-tile-COG
+    /// grid, while bounding per-tile remote opens (each item is a separate COG
+    /// open, so this is the dominant cold-tile cost). Raise for sparser
+    /// collections or when serving low zooms deliberately.
+    #[serde(default = "default_stac_max_total_items")]
+    pub max_total_items: usize,
     /// Optional WGS-84 bounding box `[west, south, east, north]` used to scope
     /// Phase 1 static discovery AND to override the merged item bounds exposed
     /// to clients. Essential when a global STAC collection would otherwise
@@ -1003,6 +1015,10 @@ fn default_stac_asset_role() -> String {
 
 fn default_stac_max_items() -> usize {
     100
+}
+
+fn default_stac_max_total_items() -> usize {
+    64
 }
 
 #[cfg(feature = "dem")]

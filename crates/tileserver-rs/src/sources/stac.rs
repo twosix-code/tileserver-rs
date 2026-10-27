@@ -67,8 +67,13 @@ struct DynamicConfig {
     collection: String,
     /// Asset role used to pick the COG asset out of returned items.
     asset_role: String,
-    /// Upper bound on items inspected per tile.
+    /// Page size for each STAC `/search` request (the `limit` sent on the wire).
+    /// The total number of items fetched per tile is bounded by
+    /// `max_total_items`, which may span several pages.
     max_items: usize,
+    /// Upper bound on the TOTAL number of items fetched per tile across all
+    /// pages. Bounds the number of remote COG opens a single tile can trigger.
+    max_total_items: usize,
     /// Base SourceConfig cloned into each ad-hoc [`CogSource`].
     template: SourceConfig,
 }
@@ -124,6 +129,7 @@ impl StacSource {
                 asset_role: config.asset_role.clone(),
                 dynamic: config.dynamic,
                 max_items: config.max_items,
+                max_total_items: config.max_total_items,
                 stac_bbox: config.stac_bbox,
                 pixel_selection: config.pixel_selection,
                 tile_path_template: None,
@@ -163,6 +169,7 @@ impl StacSource {
                 collection: collection.to_string(),
                 asset_role: asset_role.to_string(),
                 max_items,
+                max_total_items: config.max_total_items,
                 template: config.clone(),
             })
         } else {
@@ -248,6 +255,7 @@ impl StacSource {
             &cfg.collection,
             &cfg.asset_role,
             cfg.max_items,
+            cfg.max_total_items,
             bbox,
         )
         .await
@@ -510,8 +518,24 @@ pub fn tile_to_wgs84_bbox(z: u8, x: u32, y: u32) -> [f64; 4] {
 
 /// Phase 2: search the STAC API for items intersecting a bbox.
 ///
-/// Same wire format as [`discover_assets`] but injects `bbox` and drops
-/// the `limit` if the caller wants unbounded results.
+/// Same wire format as [`discover_assets`] but injects `bbox` and paginates
+/// the result set.
+///
+/// # Why pagination matters
+///
+/// A STAC `/search` response is a **single page**: the API returns at most
+/// `limit` items plus a `links[rel="next"]` entry carrying a `token` that
+/// must be POSTed back to fetch the following page. Dense spatial-grid
+/// collections (e.g. many small per-tile COGs) routinely match far more
+/// items than one page holds — a low-zoom tile can intersect hundreds of
+/// them. Fetching only the first page renders a sparse scatter of footprints
+/// with transparent gaps that grow as the tile covers more items.
+///
+/// This function therefore follows `next` links until either the collection
+/// is exhausted for this bbox or `max_total_items` is reached, whichever
+/// comes first. `max_items` is the **page size** (each request's `limit`);
+/// `max_total_items` bounds the total fetched so a single tile cannot spawn
+/// an unbounded number of remote COG opens.
 ///
 /// # Errors
 ///
@@ -521,6 +545,7 @@ pub async fn discover_assets_by_bbox(
     collection: &str,
     asset_role: &str,
     max_items: usize,
+    max_total_items: usize,
     bbox: [f64; 4],
 ) -> Result<Vec<StacAsset>> {
     let search_url = build_search_url(api_url);
@@ -529,32 +554,111 @@ pub async fn discover_assets_by_bbox(
         .build()
         .map_err(|e| TileServerError::StacError(format!("failed to create HTTP client: {e}")))?;
 
-    let search_body = serde_json::json!({
-        "collections": [collection],
-        "bbox": bbox,
-        "limit": max_items
-    });
+    // Page size: at least 1, never more than the total cap.
+    let page_size = max_items.max(1).min(max_total_items.max(1));
 
-    let response = client
-        .post(&search_url)
-        .json(&search_body)
-        .send()
-        .await
-        .map_err(|e| TileServerError::StacError(format!("stac bbox search failed: {e}")))?;
+    let mut assets: Vec<StacAsset> = Vec::new();
+    // `None` = first request (no token); `Some(token)` = follow `next`.
+    let mut next_token: Option<String> = None;
+    let mut pages = 0usize;
 
-    if !response.status().is_success() {
-        return Err(TileServerError::StacError(format!(
-            "stac api returned status {}",
-            response.status()
-        )));
+    loop {
+        let mut search_body = serde_json::json!({
+            "collections": [collection],
+            "bbox": bbox,
+            "limit": page_size
+        });
+        if let Some(token) = &next_token {
+            search_body["token"] = serde_json::Value::String(token.clone());
+        }
+
+        let response = client
+            .post(&search_url)
+            .json(&search_body)
+            .send()
+            .await
+            .map_err(|e| TileServerError::StacError(format!("stac bbox search failed: {e}")))?;
+
+        if !response.status().is_success() {
+            // A failure on the FIRST page is fatal; a failure mid-pagination
+            // keeps what we already have rather than blanking the tile.
+            if pages == 0 {
+                return Err(TileServerError::StacError(format!(
+                    "stac api returned status {}",
+                    response.status()
+                )));
+            }
+            tracing::warn!(
+                status = %response.status(),
+                pages,
+                "stac pagination stopped early; using partial result set"
+            );
+            break;
+        }
+
+        let body: serde_json::Value = response.json().await.map_err(|e| {
+            TileServerError::StacError(format!("failed to parse stac response: {e}"))
+        })?;
+
+        let page_assets = extract_assets_from_item_collection(&body, asset_role)?;
+        let page_len = page_assets.len();
+        assets.extend(page_assets);
+        pages += 1;
+
+        // Stop when the total cap is reached.
+        if assets.len() >= max_total_items {
+            assets.truncate(max_total_items);
+            break;
+        }
+        // A short page means the collection is exhausted for this bbox.
+        if page_len < page_size {
+            break;
+        }
+
+        next_token = next_page_token(&body);
+        if next_token.is_none() {
+            break;
+        }
     }
 
-    let body: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| TileServerError::StacError(format!("failed to parse stac response: {e}")))?;
+    Ok(assets)
+}
 
-    extract_assets_from_item_collection(&body, asset_role)
+/// Extract the pagination token from a STAC `/search` response.
+///
+/// STAC APIs signal more results with a `links` entry whose `rel` is `next`.
+/// Two shapes are in the wild:
+/// - a `token` in the link's `body` (POST-based paging — the openEO/VITO API),
+/// - a `token` query parameter on the link's `href` (GET-based paging).
+///
+/// Returns `None` when there is no `next` link or no token can be recovered.
+#[must_use]
+fn next_page_token(body: &serde_json::Value) -> Option<String> {
+    let links = body.get("links")?.as_array()?;
+    let next = links
+        .iter()
+        .find(|l| l.get("rel").and_then(|r| r.as_str()) == Some("next"))?;
+
+    // Shape 1: token in the link body (POST paging).
+    if let Some(token) = next
+        .get("body")
+        .and_then(|b| b.get("token"))
+        .and_then(|t| t.as_str())
+    {
+        return Some(token.to_string());
+    }
+
+    // Shape 2: token as a query parameter on the href (GET paging).
+    let href = next.get("href").and_then(|h| h.as_str())?;
+    let query = href.split_once('?')?.1;
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=')
+            && k == "token"
+        {
+            return Some(v.to_string());
+        }
+    }
+    None
 }
 
 // `to_gdal_cog_path` lives in the non-feature-gated `sources` module so that
@@ -595,6 +699,7 @@ async fn render_single_asset(
         asset_role: template.asset_role.clone(),
         dynamic: false,
         max_items: template.max_items,
+        max_total_items: template.max_total_items,
         stac_bbox: template.stac_bbox,
         pixel_selection: template.pixel_selection,
         tile_path_template: None,
@@ -1528,5 +1633,99 @@ mod tests {
         let collection = sample_item_collection(vec![]);
         let assets = extract_assets_from_item_collection(&collection, "data").unwrap();
         assert!(assets.is_empty());
+    }
+
+    // ---- Pagination token extraction (dynamic STAC mosaic) ----
+
+    /// A STAC `/search` response with a POST-paging `next` link whose
+    /// `body` carries the continuation token (the openEO/VITO shape).
+    fn collection_with_next_body_token(token: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "FeatureCollection",
+            "features": [],
+            "links": [
+                {
+                    "rel": "next",
+                    "method": "POST",
+                    "href": "https://stac.example.org/search",
+                    "body": { "token": token }
+                },
+                { "rel": "root", "href": "https://stac.example.org/" }
+            ]
+        })
+    }
+
+    #[test]
+    fn test_next_page_token_from_link_body() {
+        let body = collection_with_next_body_token("abc123");
+        assert_eq!(next_page_token(&body).as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn test_next_page_token_from_href_query() {
+        let body = serde_json::json!({
+            "type": "FeatureCollection",
+            "features": [],
+            "links": [{ "rel": "next", "href": "https://stac.example.org/search?limit=10&token=xyz789" }]
+        });
+        assert_eq!(next_page_token(&body).as_deref(), Some("xyz789"));
+    }
+
+    #[test]
+    fn test_next_page_token_absent_when_no_next_link() {
+        let body = serde_json::json!({
+            "type": "FeatureCollection",
+            "features": [],
+            "links": [{ "rel": "self", "href": "https://stac.example.org/search" }]
+        });
+        assert_eq!(next_page_token(&body), None);
+    }
+
+    #[test]
+    fn test_next_page_token_absent_when_no_links() {
+        let body = sample_item_collection(vec![]);
+        assert_eq!(next_page_token(&body), None);
+    }
+
+    #[test]
+    fn test_next_page_token_next_link_without_token() {
+        // A `next` link with neither a body token nor a token query param
+        // must not yield a token (would otherwise loop forever).
+        let body = serde_json::json!({
+            "type": "FeatureCollection",
+            "features": [],
+            "links": [{ "rel": "next", "href": "https://stac.example.org/search" }]
+        });
+        assert_eq!(next_page_token(&body), None);
+    }
+
+    #[test]
+    fn test_source_config_max_total_items_defaults_and_overrides() {
+        use crate::config::{SourceConfig, SourceType};
+
+        // Omitted -> default cap (bounds per-tile remote COG opens for dense
+        // spatial grids).
+        let toml = r#"
+id = "s"
+type = "stac"
+path = "https://stac.example.org"
+collection = "C"
+"#;
+        let cfg: SourceConfig = toml::from_str(toml).expect("parses");
+        assert_eq!(cfg.source_type, SourceType::Stac);
+        assert_eq!(cfg.max_total_items, 64);
+
+        // Explicit override is honoured.
+        let toml = r#"
+id = "s"
+type = "stac"
+path = "https://stac.example.org"
+collection = "C"
+max_items = 20
+max_total_items = 200
+"#;
+        let cfg: SourceConfig = toml::from_str(toml).expect("parses");
+        assert_eq!(cfg.max_items, 20);
+        assert_eq!(cfg.max_total_items, 200);
     }
 }
