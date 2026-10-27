@@ -617,10 +617,44 @@ impl SourceManager {
             .get(id)
             .ok_or_else(|| TileServerError::SourceNotFound(id.to_string()))?;
 
-        if let Some(cog) = source.as_ref().as_any().downcast_ref::<CogSource>() {
+        let format = source.format();
+
+        // Raster tiles are deterministic in `(id, z, x, y, encoding, filter)`:
+        // the same request always yields the same bytes (same overview level,
+        // same warp target, same colormap).  They are therefore just as
+        // cacheable as vector tiles, and the same global tile cache applies.
+        //
+        // The cache key deliberately does NOT include `tile_size` or
+        // `resampling`: the tile route always requests 256 px and the source's
+        // configured resampling, so the two are constant for a given source.
+        // A caller that overrides either (only tests do today) would otherwise
+        // risk colliding with the route's cached entry; that is acceptable
+        // because no production caller varies them.
+        let cache_key = self
+            .global_cache
+            .as_ref()
+            .map(|_| crate::cache::TileCacheKey {
+                source_id: id.into(),
+                z,
+                x,
+                y,
+                encoding: crate::sources::TileCompression::None,
+                filter: self.preset_hash(id),
+            });
+        if let (Some(cache), Some(key)) = (&self.global_cache, cache_key.as_ref())
+            && let Some(cached) = cache.get(key).await
+        {
+            crate::metrics::cache_hit_recorded(id);
+            return Ok(Some(cached));
+        }
+        if self.global_cache.is_some() {
+            crate::metrics::cache_miss_recorded(id);
+        }
+
+        let tile = if let Some(cog) = source.as_ref().as_any().downcast_ref::<CogSource>() {
             let resample = resampling.unwrap_or(cog.resampling());
             cog.get_tile_with_resampling(z, x, y, tile_size, resample)
-                .await
+                .await?
         } else {
             #[cfg(feature = "dem")]
             if let Some(dem) = source
@@ -628,23 +662,51 @@ impl SourceManager {
                 .as_any()
                 .downcast_ref::<crate::sources::dem::DemSource>()
             {
-                return dem.get_tile_sized(z, x, y, tile_size).await;
+                dem.get_tile_sized(z, x, y, tile_size).await?
+            } else {
+                #[cfg(feature = "postgres")]
+                if let Some(outdb) = source
+                    .as_ref()
+                    .as_any()
+                    .downcast_ref::<PostgresOutDbRasterSource>()
+                {
+                    outdb
+                        .get_tile_with_params(z, x, y, tile_size, resampling, query_params)
+                        .await?
+                } else {
+                    #[cfg(not(feature = "postgres"))]
+                    let _ = query_params;
+                    let tile = source.get_tile(z, x, y).await?;
+                    self.apply_preset(id, tile)?
+                }
             }
-            #[cfg(feature = "postgres")]
-            if let Some(outdb) = source
-                .as_ref()
-                .as_any()
-                .downcast_ref::<PostgresOutDbRasterSource>()
+            #[cfg(not(feature = "dem"))]
             {
-                return outdb
-                    .get_tile_with_params(z, x, y, tile_size, resampling, query_params)
-                    .await;
+                #[cfg(feature = "postgres")]
+                if let Some(outdb) = source
+                    .as_ref()
+                    .as_any()
+                    .downcast_ref::<PostgresOutDbRasterSource>()
+                {
+                    outdb
+                        .get_tile_with_params(z, x, y, tile_size, resampling, query_params)
+                        .await?
+                } else {
+                    #[cfg(not(feature = "postgres"))]
+                    let _ = query_params;
+                    let tile = source.get_tile(z, x, y).await?;
+                    self.apply_preset(id, tile)?
+                }
             }
-            #[cfg(not(feature = "postgres"))]
-            let _ = query_params;
-            let tile = source.get_tile(z, x, y).await?;
-            self.apply_preset(id, tile)
+        };
+
+        let _ = format;
+        if let (Some(cache), Some(key)) = (&self.global_cache, cache_key)
+            && let Some(ref tile) = tile
+        {
+            cache.insert(key, tile.clone()).await;
         }
+        Ok(tile)
     }
 
     #[cfg(all(feature = "postgres", feature = "raster"))]
@@ -1389,5 +1451,194 @@ mod tests {
         );
         let mgr = SourceManager::from_sources(map);
         assert!(!mgr.is_outdb_raster_source("mock"));
+    }
+
+    // -------- raster-path caching --------
+    //
+    // The raster dispatch used to bypass `global_cache` entirely, so a
+    // `cog`/`dem` source was recomputed (warp + read + encode, plus remote
+    // range-reads) on every request even with `[cache]` enabled.  These tests
+    // pin the new behaviour: the raster path consults and populates the same
+    // global cache as the vector path, and never caches a `None`.
+
+    /// A raster tile source that counts how many times `get_tile` ran, so a
+    /// cache hit is observable as "the source was not consulted again".
+    #[cfg(feature = "raster")]
+    struct CountingRasterSource {
+        meta: TileMetadata,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[cfg(feature = "raster")]
+    #[async_trait]
+    impl TileSource for CountingRasterSource {
+        async fn get_tile(
+            &self,
+            _z: u8,
+            _x: u32,
+            _y: u32,
+        ) -> crate::error::Result<Option<TileData>> {
+            use std::sync::atomic::Ordering;
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(TileData {
+                data: Bytes::from_static(b"mock-raster-png"),
+                format: TileFormat::Png,
+                compression: TileCompression::None,
+            }))
+        }
+        fn metadata(&self) -> &TileMetadata {
+            &self.meta
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[cfg(feature = "raster")]
+    fn counting_raster_source(
+        id: &str,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Arc<dyn TileSource> {
+        Arc::new(CountingRasterSource {
+            meta: TileMetadata {
+                id: id.to_string(),
+                name: id.to_string(),
+                description: None,
+                attribution: None,
+                format: TileFormat::Png,
+                minzoom: 0,
+                maxzoom: 14,
+                bounds: None,
+                center: None,
+                vector_layers: None,
+            },
+            calls,
+        })
+    }
+
+    /// Second request for the same raster tile must be served from the cache:
+    /// the source is consulted once, and the returned bytes are identical.
+    #[cfg(feature = "raster")]
+    #[tokio::test]
+    async fn raster_tile_with_cache_served_from_cache_on_second_call() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut map = HashMap::new();
+        map.insert(
+            "cog-c".to_string(),
+            counting_raster_source("cog-c", calls.clone()),
+        );
+        let cache = Arc::new(crate::cache::TileCache::new(4, 3600));
+        let mgr = SourceManager::from_sources(map).with_cache(cache);
+
+        let first = mgr
+            .get_raster_tile_with_params("cog-c", 5, 1, 1, 256, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.data.as_ref(), b"mock-raster-png");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "first call must hit the source"
+        );
+
+        let second = mgr
+            .get_raster_tile_with_params("cog-c", 5, 1, 1, 256, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.data.as_ref(), b"mock-raster-png");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "second call must be served from the cache, not the source"
+        );
+    }
+
+    /// A different `(z, x, y)` is a different key and must miss.
+    #[cfg(feature = "raster")]
+    #[tokio::test]
+    async fn raster_tile_different_coords_do_not_share_a_cache_entry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut map = HashMap::new();
+        map.insert(
+            "cog-d".to_string(),
+            counting_raster_source("cog-d", calls.clone()),
+        );
+        let cache = Arc::new(crate::cache::TileCache::new(4, 3600));
+        let mgr = SourceManager::from_sources(map).with_cache(cache);
+
+        mgr.get_raster_tile_with_params("cog-d", 5, 1, 1, 256, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        mgr.get_raster_tile_with_params("cog-d", 5, 1, 2, 256, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "distinct tiles must each hit the source"
+        );
+    }
+
+    /// Without a cache configured the raster path must still work (no
+    /// regression for the default deployment) and consult the source every
+    /// time.
+    #[cfg(feature = "raster")]
+    #[tokio::test]
+    async fn raster_tile_without_cache_always_consults_source() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut map = HashMap::new();
+        map.insert(
+            "cog-n".to_string(),
+            counting_raster_source("cog-n", calls.clone()),
+        );
+        let mgr = SourceManager::from_sources(map);
+
+        mgr.get_raster_tile_with_params("cog-n", 5, 1, 1, 256, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        mgr.get_raster_tile_with_params("cog-n", 5, 1, 1, 256, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "no cache means no short-circuit"
+        );
+    }
+
+    /// A `None` tile must not be cached: the key stays absent so a source that
+    /// later gains coverage at those coords is not permanently shadowed.
+    #[cfg(feature = "raster")]
+    #[tokio::test]
+    async fn raster_tile_none_via_cache_does_not_pollute_cache() {
+        let mut map = HashMap::new();
+        map.insert("cog-empty".to_string(), none_source("cog-empty"));
+        let cache = Arc::new(crate::cache::TileCache::new(4, 3600));
+        let mgr = SourceManager::from_sources(map).with_cache(cache.clone());
+
+        let result = mgr
+            .get_raster_tile_with_params("cog-empty", 2, 1, 1, 256, None, None)
+            .await
+            .unwrap();
+        assert!(result.is_none());
+
+        let key = crate::cache::TileCacheKey {
+            source_id: "cog-empty".into(),
+            z: 2,
+            x: 1,
+            y: 1,
+            encoding: crate::sources::TileCompression::None,
+            filter: 0,
+        };
+        assert!(cache.get(&key).await.is_none(), "None must not be cached");
     }
 }
