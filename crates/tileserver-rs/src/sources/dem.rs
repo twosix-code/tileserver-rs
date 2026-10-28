@@ -298,8 +298,11 @@ impl DemSource {
         let resampling: ResampleAlg = self.resampling.into();
         let params = self.params;
 
+        // Acquire on the async thread so a budget refusal can reclaim idle
+        // pools and retry; see `DatasetCache::acquire_with_reclaim`.
+        let handle = dataset_cache::global().acquire_with_reclaim(&pool).await?;
+
         let png = tokio::task::spawn_blocking(move || {
-            let handle = pool.acquire_blocking()?;
             render_dem_tile(
                 handle.dataset(),
                 minx,
