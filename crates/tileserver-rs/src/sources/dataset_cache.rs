@@ -72,6 +72,41 @@ const DEFAULT_TTL_SECONDS: u64 = 600;
 /// when a weigher is installed (see [`DatasetCache::with_max_bytes`]).
 const DEFAULT_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Environment override for [`DEFAULT_MAX_BYTES`], in bytes.
+///
+/// A dynamic STAC mosaic opens one handle per asset, each costing
+/// [`BASE_COST_BYTES`], so an N-asset mosaic needs roughly
+/// `N * BASE_COST_BYTES` of budget to hold every asset at once. A 20-asset
+/// supercell mosaic therefore saturates the 256 MB default exactly, and any
+/// further asset fails with [`TileServerError::BudgetExhausted`] — tiles still
+/// render (the mosaic degrades to partial coverage) but the log fills with
+/// budget warnings and cold renders re-open assets constantly.
+///
+/// Deployments with large mosaics can raise this without a rebuild; the
+/// default stays conservative so the crate does not assume a big host.
+const MAX_BYTES_ENV: &str = "TILESERVER_DATASET_CACHE_MAX_BYTES";
+
+/// Resolve the effective byte budget: env override if set and parseable,
+/// otherwise [`DEFAULT_MAX_BYTES`].
+///
+/// An unparseable or zero value is ignored rather than treated as fatal — a
+/// zero budget would make every cache miss fail, which is never the intent of
+/// a typo in an env var.
+fn resolve_max_bytes() -> u64 {
+    match std::env::var(MAX_BYTES_ENV) {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(bytes) if bytes > 0 => bytes,
+            _ => {
+                tracing::warn!(
+                    "{MAX_BYTES_ENV}={raw:?} is not a positive integer; using default {DEFAULT_MAX_BYTES}"
+                );
+                DEFAULT_MAX_BYTES
+            }
+        },
+        Err(_) => DEFAULT_MAX_BYTES,
+    }
+}
+
 /// Estimated resident cost of holding one open GDAL dataset, in bytes.
 ///
 /// A `gdal::Dataset` cannot report its true heap use, so this is a deliberate
@@ -781,10 +816,11 @@ static GLOBAL: OnceLock<DatasetCache> = OnceLock::new();
 /// (which opens one dataset per overview level) from pinning gigabytes.
 pub fn global() -> &'static DatasetCache {
     GLOBAL.get_or_init(|| {
+        let max_bytes = resolve_max_bytes();
         DatasetCache::with_max_bytes(
             0, // byte budget is the only bound; no entry cap
             Duration::from_secs(DEFAULT_TTL_SECONDS),
-            DEFAULT_MAX_BYTES,
+            max_bytes,
         )
     })
 }
@@ -1102,5 +1138,42 @@ mod tests {
     #[test]
     fn global_is_stable_across_calls() {
         assert!(std::ptr::eq(global(), global()));
+    }
+
+    /// `resolve_max_bytes` must prefer a valid env override, and must fall
+    /// back to the default for anything unparseable or non-positive.
+    ///
+    /// Run in one test to avoid env races between parallel test threads.
+    #[test]
+    fn resolve_max_bytes_honours_env_override() {
+        // SAFETY: `set_var`/`remove_var` are unsafe in edition 2024 because a
+        // concurrent `getenv` in another thread could observe a torn value.
+        // This test owns `MAX_BYTES_ENV` exclusively — no other test reads or
+        // writes it (it is not used by production code, only by
+        // `resolve_max_bytes` at cache init), and we restore the previous
+        // value before returning so the process environment is unchanged.
+        unsafe {
+            let prev = std::env::var(MAX_BYTES_ENV).ok();
+
+            std::env::set_var(MAX_BYTES_ENV, "1073741824");
+            assert_eq!(resolve_max_bytes(), 1024 * 1024 * 1024);
+
+            std::env::set_var(MAX_BYTES_ENV, "  268435456  ");
+            assert_eq!(resolve_max_bytes(), 256 * 1024 * 1024, "whitespace trimmed");
+
+            std::env::set_var(MAX_BYTES_ENV, "0");
+            assert_eq!(resolve_max_bytes(), DEFAULT_MAX_BYTES, "zero is rejected");
+
+            std::env::set_var(MAX_BYTES_ENV, "not-a-number");
+            assert_eq!(resolve_max_bytes(), DEFAULT_MAX_BYTES, "garbage rejected");
+
+            std::env::remove_var(MAX_BYTES_ENV);
+            assert_eq!(resolve_max_bytes(), DEFAULT_MAX_BYTES, "unset uses default");
+
+            match prev {
+                Some(v) => std::env::set_var(MAX_BYTES_ENV, v),
+                None => std::env::remove_var(MAX_BYTES_ENV),
+            }
+        }
     }
 }
