@@ -903,6 +903,7 @@ mod tests {
             asset_role: "data".to_string(),
             dynamic: false,
             max_items: 500,
+            max_total_items: 64,
             stac_bbox: None,
             pixel_selection: crate::config::PixelSelectionMethod::First,
             tile_path_template: None,
