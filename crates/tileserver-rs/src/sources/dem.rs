@@ -38,7 +38,6 @@ use gdal::{DriverManager, raster::reproject};
 use image::{ImageBuffer, RgbaImage};
 use std::io::Cursor;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 
 use crate::config::{DemEncoding, ResamplingMethod, SourceConfig};
 use crate::error::{Result, TileServerError};
@@ -181,7 +180,10 @@ pub fn encode_pixels(values: &[f64], params: &EncodeParams) -> Vec<u8> {
 
 /// A DEM tile source: float elevation in, Terrarium/Mapbox-RGB PNG out.
 pub struct DemSource {
-    dataset: Arc<Mutex<Dataset>>,
+    /// Pool of base handles for this DEM's source raster. Handles are
+    /// borrowed per render and returned to the pool on drop, in line with
+    /// `CogSource`. No `Dataset` is held here: the pool owns the handles.
+    pool: Arc<dataset_cache::Pool>,
     metadata: TileMetadata,
     resampling: ResamplingMethod,
     band: usize,
@@ -196,17 +198,18 @@ impl DemSource {
         config: &SourceConfig,
         loaded: &std::collections::HashMap<String, Arc<dyn TileSource>>,
     ) -> Result<Self> {
-        let dataset = Self::resolve_dataset(config, loaded).await?;
+        let pool = Self::resolve_dataset(config, loaded).await?;
 
-        let dataset_for_inspect = Arc::clone(&dataset);
+        let pool_for_inspect = Arc::clone(&pool);
         let bounds = tokio::task::spawn_blocking(move || {
-            let guard = dataset_for_inspect.blocking_lock();
+            let handle = pool_for_inspect.acquire_blocking()?;
+            let guard = handle.dataset();
             if guard.raster_count() == 0 {
                 return Err(TileServerError::RasterError(
                     "DEM source has no raster bands".to_string(),
                 ));
             }
-            crate::sources::cog::wgs84_bounds(&guard)
+            crate::sources::cog::wgs84_bounds(guard)
         })
         .await
         .map_err(|e| TileServerError::RasterError(format!("task failed: {e}")))??;
@@ -241,7 +244,7 @@ impl DemSource {
         };
 
         Ok(Self {
-            dataset,
+            pool,
             metadata,
             resampling: config.resampling.unwrap_or(ResamplingMethod::Bilinear),
             band: config.dem_band,
@@ -252,7 +255,7 @@ impl DemSource {
     async fn resolve_dataset(
         config: &SourceConfig,
         loaded: &std::collections::HashMap<String, Arc<dyn TileSource>>,
-    ) -> Result<Arc<Mutex<Dataset>>> {
+    ) -> Result<Arc<dataset_cache::Pool>> {
         if let Some(ref input_id) = config.input_source {
             let source = loaded.get(input_id).ok_or_else(|| {
                 TileServerError::ConfigError(format!(
@@ -266,21 +269,18 @@ impl DemSource {
                     config.id
                 ))
             })?;
-            return Ok(cog.dataset_handle());
+            return Ok(cog.base_pool());
         }
         // Normalise remote paths to a GDAL VSI prefix (see `cog.rs`): a bare
         // `https://…` URL would route through GDAL's curl→/vsimem full-download
         // shim instead of `/vsicurl/` range reads. Idempotent, so an explicit
         // `/vsicurl/` prefix in config passes through unchanged.
         let path = crate::sources::to_gdal_cog_path(&config.path);
-        // The cache now stores a *pool* per key. A DEM source holds one shared
-        // handle for its lifetime (as before), so borrow one from the pool and
-        // keep it. `into_dataset` detaches the handle from the pool: the pool no
-        // longer keeps or counts it, and this source owns the `Dataset`
-        // directly (there is no second reference through an idle list).
-        let pool = dataset_cache::global().get_or_open(&path).await?;
-        let handle = pool.acquire_arc().await?;
-        Ok(Arc::new(Mutex::new(handle.into_dataset())))
+        // The cache stores a *pool* per key. A DEM source keeps an `Arc` to
+        // that pool and borrows a handle per render, rather than detaching one
+        // handle for its own lifetime: detaching would leave the pool empty
+        // after `limit` sources and defeat the cache.
+        dataset_cache::global().get_or_open(&path).await
     }
 
     /// Render one tile, exposed directly so the manager can request a
@@ -293,15 +293,23 @@ impl DemSource {
         tile_size: u32,
     ) -> Result<Option<TileData>> {
         let (minx, miny, maxx, maxy) = tile_to_web_mercator_bbox(z, x, y);
-        let dataset = self.dataset.clone();
+        let pool = Arc::clone(&self.pool);
         let band = self.band;
         let resampling: ResampleAlg = self.resampling.into();
         let params = self.params;
 
         let png = tokio::task::spawn_blocking(move || {
-            let guard = dataset.blocking_lock();
+            let handle = pool.acquire_blocking()?;
             render_dem_tile(
-                &guard, minx, miny, maxx, maxy, tile_size, band, resampling, &params,
+                handle.dataset(),
+                minx,
+                miny,
+                maxx,
+                maxy,
+                tile_size,
+                band,
+                resampling,
+                &params,
             )
         })
         .await

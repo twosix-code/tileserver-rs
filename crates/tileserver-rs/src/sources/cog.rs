@@ -8,7 +8,6 @@ use gdal::{Dataset, DriverManager};
 use image::{ImageBuffer, RgbaImage};
 use std::io::Cursor;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 
 use crate::config::{ColorMapConfig, ResamplingMethod, SourceConfig};
 use crate::error::{Result, TileServerError};
@@ -18,7 +17,11 @@ use crate::sources::{TileCompression, TileData, TileFormat, TileMetadata, TileSo
 const WEB_MERCATOR_EXTENT: f64 = 20037508.342789244;
 
 pub struct CogSource {
-    dataset: Arc<Mutex<Dataset>>,
+    /// Base (full-resolution) pool for this COG. Handles are borrowed per
+    /// render and returned to the pool on drop, so base tiles render in
+    /// parallel just like overview tiles. No `Dataset` is held here: the pool
+    /// owns the open handles.
+    base_pool: Arc<dataset_cache::Pool>,
     metadata: TileMetadata,
     default_resampling: ResamplingMethod,
     band_count: usize,
@@ -58,28 +61,37 @@ impl CogSource {
         // cost that would otherwise be paid on every STAC-mosaic asset
         // render.  See `dataset_cache` for eviction policy.
         //
-        // The cache stores a *pool* per key; this source keeps one shared base
-        // handle for its lifetime, so borrow one from the pool and hold it.
-        // `into_dataset` detaches it from the pool (releasing the pool slot).
+        // The cache stores a *pool* per key. This source keeps an `Arc` to
+        // that pool and borrows a handle per render (base and overview alike),
+        // rather than detaching one handle for its own lifetime. Detaching
+        // would leave the pool empty after `limit` sources and defeat the
+        // cache. We borrow one handle now purely to read the metadata
+        // (band count / bounds / overview resolutions) and immediately return
+        // it to the pool.
         let pool = dataset_cache::global().get_or_open(&path).await?;
-        let base_handle = pool.acquire_arc().await?;
-        let dataset: Arc<Mutex<Dataset>> = Arc::new(Mutex::new(base_handle.into_dataset()));
-
-        let dataset_for_inspect = Arc::clone(&dataset);
-        let (band_count, bounds, overview_resolutions) = tokio::task::spawn_blocking(move || {
-            let guard = dataset_for_inspect.blocking_lock();
-            let band_count = guard.raster_count();
-            if band_count == 0 {
-                return Err(TileServerError::RasterError(
-                    "COG file has no raster bands".to_string(),
-                ));
-            }
-            let bounds = get_wgs84_bounds(&guard)?;
-            let overview_resolutions = compute_overview_resolutions(&guard)?;
-            Ok::<_, TileServerError>((band_count, bounds, overview_resolutions))
-        })
-        .await
-        .map_err(|e| TileServerError::RasterError(format!("task failed: {e}")))??;
+        let band_count;
+        let bounds;
+        let overview_resolutions;
+        {
+            let base_handle = pool.acquire_arc().await?;
+            let (bc, b, ovr) = tokio::task::spawn_blocking(move || {
+                let guard = base_handle.dataset();
+                let band_count = guard.raster_count();
+                if band_count == 0 {
+                    return Err(TileServerError::RasterError(
+                        "COG file has no raster bands".to_string(),
+                    ));
+                }
+                let bounds = get_wgs84_bounds(guard)?;
+                let overview_resolutions = compute_overview_resolutions(guard)?;
+                Ok::<_, TileServerError>((band_count, bounds, overview_resolutions))
+            })
+            .await
+            .map_err(|e| TileServerError::RasterError(format!("task failed: {e}")))??;
+            band_count = bc;
+            bounds = b;
+            overview_resolutions = ovr;
+        } // `base_handle` returned to the pool here.
 
         let metadata = TileMetadata {
             id,
@@ -99,7 +111,7 @@ impl CogSource {
         };
 
         Ok(Self {
-            dataset,
+            base_pool: pool,
             metadata,
             default_resampling: resampling,
             band_count,
@@ -114,12 +126,12 @@ impl CogSource {
         self.default_resampling
     }
 
-    /// Share this source's cached GDAL dataset handle so a wrapping source
-    /// (e.g. a DEM source whose `input_source` points here) can read the
-    /// same float bands without re-opening the file.
+    /// Share this source's base pool so a wrapping source (e.g. a DEM source
+    /// whose `input_source` points here) can borrow handles from the same
+    /// cached float bands without re-opening the file.
     #[must_use]
-    pub fn dataset_handle(&self) -> Arc<Mutex<Dataset>> {
-        Arc::clone(&self.dataset)
+    pub fn base_pool(&self) -> Arc<dataset_cache::Pool> {
+        Arc::clone(&self.base_pool)
     }
 
     pub async fn get_tile_with_resampling(
@@ -138,64 +150,53 @@ impl CogSource {
         let band_count = self.band_count;
         let colormap = self.colormap.clone();
         let path = self.path.clone();
-        let dataset = self.dataset.clone();
+        let base_pool = Arc::clone(&self.base_pool);
 
-        // `overview_index` of 0 means "use the full-resolution base", which is
-        // already the cached dataset.  Any other value means "read from overview
-        // level `overview_index - 1`", which requires re-opening the source with
-        // GDAL's `OVERVIEW_LEVEL` open option.
+        // `overview_index` of 0 means "read the full-resolution base". Any
+        // other value means "read from overview level `overview_index - 1`",
+        // which requires re-opening the source with GDAL's `OVERVIEW_LEVEL`
+        // open option.
         //
-        // Overview-level-opened datasets are **cached per (path, level)** in the
-        // process-global `dataset_cache` (mirroring rio-tiler's per-level reader
-        // cache).  Each level keeps a *pool* of handles, not one shared handle:
-        // concurrent tiles at the same level each borrow a different handle and
-        // render in parallel (a single `Arc<Mutex<Dataset>>` serialised them).
-        // This keeps the cached-open win without the concurrency regression.
-        // The cache lookup itself is async and runs on the async runtime, before
-        // the blocking render is spawned.
-        let render_pool: Option<Arc<dataset_cache::Pool>> = if overview_index == 0 {
-            None
+        // Both base and overview datasets are **cached per key** in the
+        // process-global `dataset_cache` (mirroring rio-tiler's per-level
+        // reader cache): the base under `{path}`, each overview under
+        // `{path}#ovr{n}`. Each key keeps a *pool* of handles, not one shared
+        // handle, and a handle is **borrowed per render** and returned to the
+        // pool on drop. This means concurrent tiles at the same level each
+        // borrow a different handle and render in parallel (a single
+        // `Arc<Mutex<Dataset>>` serialised them) without detaching handles
+        // from the pool (detaching leaf the pool empty after `limit` sources
+        // and defeated the cache).
+        // The overview-pool cache lookup is async and runs on the async
+        // runtime, before the blocking render is spawned.
+        let render_pool: Arc<dataset_cache::Pool> = if overview_index == 0 {
+            base_pool
         } else {
             let ovr_level = overview_index - 1;
             let ovr_arg = format!("OVERVIEW_LEVEL={ovr_level}");
             let key = format!("{path}#ovr{ovr_level}");
-            Some(
-                dataset_cache::global()
-                    .get_or_open_with_options(&key, &path, &[&ovr_arg])
-                    .await?,
-            )
+            dataset_cache::global()
+                .get_or_open_with_options(&key, &path, &[&ovr_arg])
+                .await?
         };
 
         let png_data = tokio::task::spawn_blocking(move || {
-            let render_from = |dataset: &Dataset| {
-                render_tile_from_dataset(
-                    dataset,
-                    minx,
-                    miny,
-                    maxx,
-                    maxy,
-                    tile_size,
-                    band_count,
-                    resampling.into(),
-                    colormap.as_ref(),
-                )
-            };
-
-            match render_pool {
-                // Overview level: borrow a handle from the pool for the
-                // duration of the render, then return it. Borrowing (and
-                // returning) inside the blocking task is what lets concurrent
-                // renders at this level proceed in parallel.
-                Some(pool) => {
-                    let handle = pool.acquire_blocking()?;
-                    render_from(handle.dataset())
-                }
-                // Base level: the single shared handle, as before.
-                None => {
-                    let dataset = dataset.blocking_lock();
-                    render_from(&dataset)
-                }
-            }
+            // Borrow a handle from the pool for the duration of the render,
+            // then return it. Borrowing (and returning) inside the blocking
+            // task is what lets concurrent renders at this level proceed in
+            // parallel.
+            let handle = render_pool.acquire_blocking()?;
+            render_tile_from_dataset(
+                handle.dataset(),
+                minx,
+                miny,
+                maxx,
+                maxy,
+                tile_size,
+                band_count,
+                resampling.into(),
+                colormap.as_ref(),
+            )
         })
         .await
         .map_err(|e| TileServerError::RasterError(format!("task failed: {e}")))??;

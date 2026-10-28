@@ -89,15 +89,6 @@ const DEFAULT_MAX_BYTES: u64 = 256 * 1024 * 1024;
 const OVERVIEW_COST_BYTES: u64 = 8 * 1024 * 1024;
 const BASE_COST_BYTES: u64 = 16 * 1024 * 1024;
 
-/// Process-wide count of open datasets held across *all* pools, in bytes.
-///
-/// This is the number the byte budget actually gates on: [`Pool::reserve_budget`]
-/// increments it before opening and the decrement happens when a handle is
-/// dropped (see [`PooledHandle`]). Keeping it process-global (rather than
-/// per-pool) is what makes the budget a bound on the whole cache instead of a
-/// per-key bound that multiplies by the number of keys.
-static GLOBAL_LIVE_BYTES: AtomicU64 = AtomicU64::new(0);
-
 /// Maximum number of handles a single pool may hold.
 ///
 /// One handle per hardware thread is enough to keep the render pipeline busy
@@ -125,9 +116,11 @@ fn entry_cost_bytes(open_options: &[String]) -> u64 {
 /// A handle borrowed from a [`Pool`].
 ///
 /// Dropping it returns the underlying `Dataset` to the pool's idle list (or
-/// closes it if the pool is gone), and releases its byte cost from
-/// [`GLOBAL_LIVE_BYTES`]. This makes release panic-safe: a render that unwinds
-/// still returns its slot, so the pool cannot leak capacity.
+/// closes it if the pool is gone). The handle's byte cost stays counted in the
+/// pool's cache while it is borrowed, and is released only when the pool
+/// itself is dropped/evicted (`Drop for Pool`). This makes release panic-safe:
+/// a render that unwinds still returns its slot, so the pool cannot leak
+/// capacity.
 pub struct PooledHandle {
     dataset: Option<Dataset>,
     pool: Arc<Pool>,
@@ -140,30 +133,6 @@ impl PooledHandle {
         self.dataset
             .as_ref()
             .expect("PooledHandle dataset taken only on drop")
-    }
-
-    /// Take ownership of the dataset, detaching it from the pool.
-    ///
-    /// Used by sources that hold a single long-lived handle (e.g. a DEM source
-    /// whose lifetime spans many tiles) rather than borrowing per render. The
-    /// caller now owns the handle: the pool no longer keeps it and no longer
-    /// counts it, so this releases the slot it held — `live` is decremented
-    /// and the handle's cost is returned to [`GLOBAL_LIVE_BYTES`] here, and the
-    /// waiter is woken. (Without this the slot would leak: after `limit` such
-    /// calls on one path the pool would be full with an empty idle list and the
-    /// next acquire would wait forever.)
-    #[must_use]
-    pub fn into_dataset(mut self) -> Dataset {
-        let dataset = self
-            .dataset
-            .take()
-            .expect("PooledHandle dataset taken only on drop");
-        let mut state = self.pool.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.live -= 1;
-        drop(state);
-        GLOBAL_LIVE_BYTES.fetch_sub(self.pool.cost_bytes, Ordering::AcqRel);
-        self.pool.returned.notify_one();
-        dataset
     }
 }
 
@@ -187,16 +156,16 @@ impl Drop for Pool {
     fn drop(&mut self) {
         // Release the byte budget held by any handles the pool still owns at
         // eviction time (TTL or `invalidate`). Without this the idle handles
-        // close but `live * cost_bytes` stays in `GLOBAL_LIVE_BYTES`, so the
-        // budget fills up and stays full and the server stops opening datasets
-        // after a while. `live` here counts only handles the pool still owns
-        // (borrowed handles have been moved out via `into_dataset` and already
-        // released their slot).
+        // close but `live * cost_bytes` stays in the cache's live-bytes
+        // counter, so the budget fills up and stays full and the server stops
+        // opening datasets after a while. `live` here counts only handles the
+        // pool still owns.
         let live = self
             .state
             .get_mut()
             .map_or_else(|e| e.into_inner().live, |s| s.live);
-        GLOBAL_LIVE_BYTES.fetch_sub(live as u64 * self.cost_bytes, Ordering::AcqRel);
+        self.live_bytes
+            .fetch_sub(live as u64 * self.cost_bytes, Ordering::AcqRel);
     }
 }
 
@@ -242,9 +211,14 @@ pub struct Pool {
     /// Byte cost of one handle in this pool (same for all handles in a pool,
     /// since they share `open_options`).
     cost_bytes: u64,
-    /// Process-wide byte budget; a new handle is refused once the live total
-    /// would exceed it.
+    /// Cache-wide byte budget; a new handle is refused once the cache's live
+    /// total would exceed it.
     max_bytes: u64,
+    /// Shared live-bytes counter owned by the [`DatasetCache`] this pool
+    /// belongs to. `reserve_budget` and `Drop` read/write it, so the budget is
+    /// a per-cache bound rather than a process-wide one. Each pool holds a
+    /// clone of the cache's `Arc`.
+    live_bytes: Arc<AtomicU64>,
     /// Path to open new handles from.
     path: String,
     /// Open options (e.g. `OVERVIEW_LEVEL=N`) to open new handles with.
@@ -260,8 +234,14 @@ struct PoolState {
 }
 
 impl Pool {
-    /// Create an empty pool for `path` opened with `open_options`.
-    fn new(path: String, open_options: Vec<String>, max_bytes: u64) -> Self {
+    /// Create an empty pool for `path` opened with `open_options`, sharing the
+    /// cache's live-bytes counter `live_bytes`.
+    fn new(
+        path: String,
+        open_options: Vec<String>,
+        max_bytes: u64,
+        live_bytes: Arc<AtomicU64>,
+    ) -> Self {
         let limit = pool_limit().max(1);
         let cost_bytes = entry_cost_bytes(&open_options);
         Self {
@@ -273,6 +253,7 @@ impl Pool {
             limit,
             cost_bytes,
             max_bytes,
+            live_bytes,
             path,
             open_options,
         }
@@ -357,7 +338,7 @@ impl Pool {
                     }
                     Err(e) => {
                         // Open failed: release the reservation we just took.
-                        GLOBAL_LIVE_BYTES.fetch_sub(self.cost_bytes, Ordering::AcqRel);
+                        self.live_bytes.fetch_sub(self.cost_bytes, Ordering::AcqRel);
                         return Err(e);
                     }
                 }
@@ -367,7 +348,7 @@ impl Pool {
             //     handle exists that could later be returned, so waiting on
             //     the condvar would block forever. This is the case where the
             //     byte budget is smaller than a single handle's cost (or the
-            //     global budget is already exhausted with no pool handle to
+            //     cache budget is already exhausted with no pool handle to
             //     borrow from). Return an error rather than deadlock.
             if state.live == 0 {
                 return Err(TileServerError::RasterError(format!(
@@ -375,7 +356,7 @@ impl Pool {
                     self.path,
                     self.cost_bytes,
                     self.max_bytes,
-                    GLOBAL_LIVE_BYTES.load(Ordering::Acquire),
+                    self.live_bytes.load(Ordering::Acquire),
                 )));
             }
 
@@ -386,20 +367,21 @@ impl Pool {
         }
     }
 
-    /// Try to reserve `cost_bytes` against the process-wide byte budget.
+    /// Try to reserve `cost_bytes` against the cache's byte budget.
     ///
-    /// Returns `true` and increments [`GLOBAL_LIVE_BYTES`] on success; returns
-    /// `false` (leaving the total unchanged) when the budget is full.
+    /// Returns `true` and increments the cache's live-bytes counter on
+    /// success; returns `false` (leaving the total unchanged) when the budget
+    /// is full.
     ///
     /// A `max_bytes == 0` pool has **no byte budget** (the legacy
     /// entry-count-only cache) — in that case the reservation always succeeds
     /// and the open is only gated by the concurrency `limit`.
     fn reserve_budget(&self) -> bool {
         if self.max_bytes == 0 {
-            GLOBAL_LIVE_BYTES.fetch_add(self.cost_bytes, Ordering::AcqRel);
+            self.live_bytes.fetch_add(self.cost_bytes, Ordering::AcqRel);
             return true;
         }
-        GLOBAL_LIVE_BYTES
+        self.live_bytes
             .try_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
                 if cur + self.cost_bytes <= self.max_bytes {
                     Some(cur + self.cost_bytes)
@@ -437,6 +419,10 @@ impl Pool {
 pub struct DatasetCache {
     inner: Cache<String, Arc<Pool>>,
     max_bytes: u64,
+    /// This cache's live-bytes total (sum of `live * cost_bytes` over every
+    /// pool it owns). Each pool holds a clone and reserves/releases against it
+    /// via [`Pool::reserve_budget`] and `Drop for Pool`.
+    live_bytes: Arc<AtomicU64>,
 }
 
 impl DatasetCache {
@@ -454,6 +440,7 @@ impl DatasetCache {
         Self {
             inner,
             max_bytes: 0,
+            live_bytes: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -488,7 +475,11 @@ impl DatasetCache {
                 .time_to_live(ttl)
                 .support_invalidation_closures()
                 .build();
-            Self { inner, max_bytes }
+            Self {
+                inner,
+                max_bytes,
+                live_bytes: Arc::new(AtomicU64::new(0)),
+            }
         } else {
             Self::new(capacity, ttl)
         }
@@ -513,6 +504,7 @@ impl DatasetCache {
         let path_owned = path.to_string();
         let options_owned: Vec<String> = open_options.iter().map(|s| s.to_string()).collect();
         let max_bytes = self.max_bytes;
+        let live_bytes = Arc::clone(&self.live_bytes);
 
         // `try_get_with` runs the initialiser at most once per key even under
         // concurrent misses, so two cold requests do not both build a pool
@@ -523,6 +515,7 @@ impl DatasetCache {
                     path_owned,
                     options_owned,
                     max_bytes,
+                    live_bytes,
                 )))
             })
             .await
@@ -579,20 +572,20 @@ impl DatasetCache {
         self.inner.entry_count()
     }
 
-    /// Whether a specific key is currently cached (used by tests and
-    /// observability to confirm a `{path}#ovr{n}` pool was created).
+    /// Whether a specific key is currently cached (used by observability to
+    /// confirm a `{path}#ovr{n}` pool was created).
     #[must_use]
     pub fn contains_key(&self, key: &str) -> bool {
         self.inner.contains_key(key)
     }
 
-    /// Current total estimated weight in bytes across all pools.
+    /// Current total estimated weight in bytes across all pools in this cache.
     ///
-    /// This is the process-wide live total the byte budget gates on, so it is
-    /// the number to assert against in tests.
+    /// This is this cache's live total the byte budget gates on, so it is the
+    /// number to assert against in tests.
     #[must_use]
     pub fn weighted_size(&self) -> u64 {
-        GLOBAL_LIVE_BYTES.load(Ordering::Acquire)
+        self.live_bytes.load(Ordering::Acquire)
     }
 }
 
@@ -616,7 +609,6 @@ pub fn global() -> &'static DatasetCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
 
     /// Unique-ish path in a fresh tempdir; returns (dir, path). The dir must
     /// stay alive for the path to be openable.
@@ -654,7 +646,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[serial]
     async fn acquire_release_reuses_handle() {
         let Some((_dir, p)) = tiny_gtiff("tiny.tif") else {
             return;
@@ -673,7 +664,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[serial]
     async fn concurrent_acquires_get_distinct_handles() {
         // The regression this guards: N concurrent renders at one key must not
         // serialise on a single handle. With a pool, each concurrent borrower
@@ -684,7 +674,7 @@ mod tests {
         let cache = DatasetCache::new(10, Duration::from_secs(60));
         let pool = cache.get_or_open(&p).await.expect("pool");
 
-        let n = pool_limit().min(4).max(2);
+        let n = pool_limit().clamp(2, 4);
         let mut held: Vec<PooledHandle> = Vec::new();
         for _ in 0..n {
             held.push(pool.acquire_arc().await.expect("acquire"));
@@ -721,12 +711,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[serial]
     async fn weighted_size_counts_live_handles() {
         let Some((_dir, p)) = tiny_gtiff("tiny.tif") else {
             return;
         };
-        let before = GLOBAL_LIVE_BYTES.load(Ordering::Acquire);
         let cache = DatasetCache::with_max_bytes(0, Duration::from_secs(60), DEFAULT_MAX_BYTES);
         let pool = cache.get_or_open(&p).await.expect("pool");
         assert_eq!(pool.weighted_bytes(), 0, "empty pool weighs nothing");
@@ -736,7 +724,7 @@ mod tests {
             BASE_COST_BYTES,
             "one base handle costs BASE_COST_BYTES"
         );
-        assert_eq!(cache.weighted_size(), before + BASE_COST_BYTES);
+        assert_eq!(cache.weighted_size(), BASE_COST_BYTES);
         drop(h);
         // Handle is returned to idle, still open, so still counted.
         assert_eq!(pool.weighted_bytes(), BASE_COST_BYTES);
@@ -786,81 +774,48 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[serial]
-    async fn into_dataset_releases_the_slot() {
-        // Regression: `into_dataset` used to leave `live` and
-        // `GLOBAL_LIVE_BYTES` incremented with nothing to give the slot back,
-        // so after `limit` calls on one path the pool was full with an empty
-        // idle list and the next acquire waited forever (this is what hung the
-        // `raster_sources` tests in CI).
-        //
-        // `#[serial]`: asserts against the process-global `GLOBAL_LIVE_BYTES`,
-        // which other tests also mutate, so this must not run concurrently
-        // with them.
-        let Some((_dir, p)) = tiny_gtiff("tiny.tif") else {
-            return;
-        };
-        let cache = DatasetCache::with_max_bytes(0, Duration::from_secs(60), DEFAULT_MAX_BYTES);
-        let pool = cache.get_or_open(&p).await.expect("pool");
-        let limit = pool_limit();
-        let before = GLOBAL_LIVE_BYTES.load(Ordering::Acquire);
-
-        // Take and detach more handles than the pool's limit allows to hold at
-        // once. If the slot were leaked, `live` would stay at `limit` and the
-        // `limit + 1`-th acquire would block forever.
-        for i in 0..=limit {
-            let handle = pool
-                .acquire_arc()
-                .await
-                .unwrap_or_else(|e| panic!("acquire {i} failed: {e}"));
-            let _dataset = handle.into_dataset();
-            assert_eq!(pool.live_handles(), 0, "detached handle must free its slot");
-        }
-        assert_eq!(
-            GLOBAL_LIVE_BYTES.load(Ordering::Acquire),
-            before,
-            "detached handles must release their byte cost"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[serial]
     async fn evicted_pool_releases_its_bytes() {
         // Regression: `Pool` had no `Drop`, so an evicted pool (TTL or
         // `invalidate`) closed its idle handles but left `live * cost_bytes`
-        // in `GLOBAL_LIVE_BYTES`. The budget then filled up and stayed full,
-        // and the server stopped opening datasets after a while.
+        // in the cache's live-bytes counter. The budget then filled up and
+        // stayed full, and the server stopped opening datasets after a while.
         //
         // This test exercises `Drop for Pool` directly (a pool with an idle
-        // handle) so it does not depend on moka's *async* eviction timing,
-        // which is deliberately out of scope here. `#[serial]` keeps it from
-        // racing other tests that also mutate the process-global counter.
+        // handle), with its own standalone live-bytes counter, so that
+        // dropping the last `Arc<Pool>` fires `Drop` deterministically — no
+        // dependence on moka's *async* eviction timing, which is deliberately
+        // out of scope here. The assertions are against this counter, so there
+        // is no process-global state to race — no `#[serial]` needed.
         let Some((_dir, p)) = tiny_gtiff("tiny.tif") else {
             return;
         };
-        let before = GLOBAL_LIVE_BYTES.load(Ordering::Acquire);
-
-        // Build a pool directly (we own the only strong ref), open one handle,
-        // return it to idle, then drop the pool. `Drop` must release the byte
-        // cost of the idle handle it still owns.
-        let pool = Arc::new(Pool::new(p.clone(), vec![], DEFAULT_MAX_BYTES));
+        let live_bytes = Arc::new(AtomicU64::new(0));
+        let pool = Arc::new(Pool::new(
+            p.clone(),
+            vec![],
+            DEFAULT_MAX_BYTES,
+            Arc::clone(&live_bytes),
+        ));
         {
             let _h = pool.acquire_arc().await.expect("acquire");
             assert_eq!(
-                GLOBAL_LIVE_BYTES.load(Ordering::Acquire),
-                before + BASE_COST_BYTES,
+                live_bytes.load(Ordering::Acquire),
+                BASE_COST_BYTES,
                 "one live handle is counted"
             );
         } // handle dropped -> returned to idle, still counted
         assert_eq!(
-            GLOBAL_LIVE_BYTES.load(Ordering::Acquire),
-            before + BASE_COST_BYTES,
+            live_bytes.load(Ordering::Acquire),
+            BASE_COST_BYTES,
             "idle handle stays counted while the pool is alive"
         );
+
+        // Drop the only strong `Arc<Pool>`. `Drop for Pool` must release the
+        // idle handle's bytes.
         drop(pool);
         assert_eq!(
-            GLOBAL_LIVE_BYTES.load(Ordering::Acquire),
-            before,
+            live_bytes.load(Ordering::Acquire),
+            0,
             "dropping the pool must release the idle handle's bytes"
         );
     }
