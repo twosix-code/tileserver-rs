@@ -340,22 +340,85 @@ impl Pool {
             .fetch_sub(live as u64 * self.cost_bytes, Ordering::AcqRel);
     }
 
-    /// Refund this pool's *idle* handles' bytes, if the pool is reclaimed.
+    /// Bytes this pool can hand back to the cache right now.
     ///
-    /// Returns the number of bytes refunded (0 if the pool was not fully idle
-    /// or was already released). Only fully idle pools are released: a pool
-    /// with a borrowed handle must keep its bytes counted, because the handle
-    /// is still in use and will come back to a pool that is still live.
-    fn release_if_idle(&self) -> u64 {
+    /// This is the amount reclaim can free **without dropping a handle that is
+    /// in use**. Two pools qualify, and the distinction was the defect:
+    ///
+    /// - **Fully idle** (`idle == live`): every handle is free, so the whole
+    ///   pool is obsolete and its bytes (`live * cost`) can be refunded, after
+    ///   which the pool is evicted and its handles closed.
+    /// - **Partially idle** (`idle < live`, some borrowed): the borrowed
+    ///   handles are mid-render and must stay counted, but the *idle* handles
+    ///   are pure overhead — nobody is reading them, and closing them costs
+    ///   nothing but a future reopen. Refunding just those bytes is safe and is
+    ///   what makes the budget recyclable under a mosaic fill.
+    ///
+    /// Previously only the fully-idle case existed, so a mosaic that had every
+    /// one of its pools mid-render (the normal shape of a dense multi-asset
+    /// tile) presented nothing reclaimable and `acquire_with_reclaim` returned
+    /// `BudgetExhausted` immediately — the saturation warning in the field.
+    ///
+    /// # Returns
+    ///
+    /// `(bytes_reclaimed, fully_idle)`. When `bytes_reclaimed == 0` the pool
+    /// has no free handles and must not be evicted.
+    ///
+    /// # Contract with the caller
+    ///
+    /// For a **partially idle** pool the caller MUST close the returned count
+    /// of idle handles ([`Self::take_idle_handles`]) — the refund is only
+    /// honest once those handles are actually gone. For a **fully idle** pool
+    /// the caller evicts the pool and the idle handles close with it.
+    fn reclaimable_bytes(&self) -> (u64, bool) {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let live = state.live;
-        if live == 0 || state.idle.len() != live {
-            return 0;
+        let idle = state.idle.len();
+        if live == 0 || idle == 0 {
+            return (0, false);
         }
-        let bytes = live as u64 * self.cost_bytes;
+        if idle == live {
+            // Whole pool is dead weight: refund everything and let the caller
+            // evict it.
+            (live as u64 * self.cost_bytes, true)
+        } else {
+            // Only the free handles can be given back; the borrowed ones stay
+            // counted in `live` and keep rendering.
+            (idle as u64 * self.cost_bytes, false)
+        }
+    }
+
+    /// Close and remove every idle handle, returning how many were taken.
+    ///
+    /// Used by the partially-idle reclaim path: the bytes for these handles
+    /// were just refunded by [`Self::release_partial`], so they must actually
+    /// be dropped for the accounting to match reality. Decorrelating the two
+    /// would let the counter drift *below* the true footprint, which is how a
+    /// cache silently overshoots its budget.
+    fn take_idle_handles(&self) -> usize {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let taken = state.idle.len();
+        // `Dataset` closes on drop; move the handles out before releasing the
+        // lock so the (possibly slow) close does not serialise other renderers.
+        let handles = std::mem::take(&mut state.idle);
+        state.live -= taken;
         drop(state);
-        self.release_budget(live);
-        bytes
+        drop(handles);
+        taken
+    }
+
+    /// Refund `count` handles' worth of bytes to the shared counter.
+    ///
+    /// Unlike [`Self::release_budget`] this does **not** set
+    /// `budget_released` — the pool stays in the cache with its borrowed
+    /// handles still counted, so a later full-idle reclaim must still be able
+    /// to refund the remainder.
+    fn release_partial(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        self.live_bytes
+            .fetch_sub(count as u64 * self.cost_bytes, Ordering::AcqRel);
     }
 
     /// Acquire a handle for one render, given an `Arc<Pool>` so the returned
@@ -783,19 +846,37 @@ impl DatasetCache {
 
         let mut reclaimed = 0u64;
         for (key, pool) in candidates {
-            // Refund first, then evict. `release_if_idle` is a no-op for pools
-            // with borrowed handles, which are exactly the ones we must not
-            // touch. The refund is explicit rather than left to `Drop for Pool`
-            // because this loop's snapshot and any caller-held `Arc<Pool>` keep
-            // the pool alive after eviction — so `Drop` would not run here and
-            // the budget would stay inflated (the original defect).
-            let bytes = pool.release_if_idle();
+            let (bytes, fully_idle) = pool.reclaimable_bytes();
             if bytes == 0 {
                 continue;
             }
-            self.inner.invalidate(&key).await;
-            drop(pool);
-            reclaimed = reclaimed.saturating_add(bytes);
+            if fully_idle {
+                // Whole pool is dead weight: refund all of it, then evict.
+                // The refund is explicit rather than left to `Drop for Pool`
+                // because this loop's snapshot and any caller-held `Arc<Pool>`
+                // keep the pool alive after eviction — so `Drop` would not run
+                // here and the budget would stay inflated (the original defect).
+                let live = pool.live_handles();
+                pool.release_budget(live);
+                self.inner.invalidate(&key).await;
+                drop(pool);
+                reclaimed = reclaimed.saturating_add(bytes);
+            } else {
+                // Partially idle: some handles are mid-render and must stay
+                // counted, but the free ones are pure overhead. Refund exactly
+                // those and close the handles so the accounting matches
+                // reality. The pool stays cached — its borrowed handles will
+                // come back to it.
+                let freed = bytes / pool.cost_bytes;
+                let taken = pool.take_idle_handles();
+                debug_assert_eq!(
+                    usize::try_from(freed).unwrap_or(usize::MAX),
+                    taken,
+                    "refund must match handles actually closed"
+                );
+                pool.release_partial(taken);
+                reclaimed = reclaimed.saturating_add(bytes);
+            }
         }
 
         if reclaimed > 0 {
@@ -1059,6 +1140,75 @@ mod tests {
         drop(held);
         // Now fully idle, so it becomes reclaimable.
         assert_eq!(cache.reclaim_idle().await, BASE_COST_BYTES);
+        assert_eq!(cache.weighted_size(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reclaim_frees_partially_idle_pool_without_evicting_it() {
+        // The field saturation this fixes: a dynamic STAC mosaic holds every
+        // pool mid-render, each with one handle borrowed and one idle. Under
+        // the old fully-idle-only rule nothing was reclaimable, so
+        // `acquire_with_reclaim` re-raised `BudgetExhausted` immediately and
+        // the log filled with budget warnings while coverage degraded.
+        //
+        // A partially idle pool must instead hand back the *free* handles'
+        // bytes while keeping the borrowed handles counted and the pool cached.
+        let Some((_dir1, p1)) = tiny_gtiff("busy1.tif") else {
+            return;
+        };
+        let Some((_dir2, p2)) = tiny_gtiff("waiting.tif") else {
+            return;
+        };
+        // Budget fits exactly two base handles.
+        let budget = BASE_COST_BYTES * 2;
+        let cache = DatasetCache::with_max_bytes(0, Duration::from_secs(60), budget);
+
+        let pool1 = cache.get_or_open(&p1).await.expect("pool1");
+        // Two handles live: one idle, one borrowed.
+        let held1 = pool1.acquire_arc().await.expect("first handle");
+        let idle1 = pool1.acquire_arc().await.expect("second handle");
+        drop(idle1); // return to the idle list, bytes still counted
+        assert_eq!(pool1.live_handles(), 2);
+        assert_eq!(cache.weighted_size(), budget, "budget is full");
+
+        // A second source is refused while pool1 holds both handles.
+        let pool2 = cache.get_or_open(&p2).await.expect("pool2");
+        assert!(
+            matches!(
+                pool2.acquire_arc().await,
+                Err(TileServerError::BudgetExhausted { .. })
+            ),
+            "second source must be refused while the budget is full"
+        );
+
+        // Reclaim: pool1 is partially idle (1 of 2 free), so exactly one
+        // handle's worth of bytes comes back and the borrowed one stays.
+        let reclaimed = cache.reclaim_idle().await;
+        assert_eq!(reclaimed, BASE_COST_BYTES, "only the idle handle is freed");
+        assert_eq!(
+            cache.weighted_size(),
+            BASE_COST_BYTES,
+            "the borrowed handle is still counted"
+        );
+        assert_eq!(pool1.live_handles(), 1, "the idle handle was closed");
+        assert!(
+            cache.contains_key(&p1),
+            "a partially idle pool must stay cached, not be evicted"
+        );
+
+        // The freed bytes are enough for the blocked source.
+        let handle2 = pool2.acquire_arc().await.expect("acquire after reclaim");
+
+        // The render that borrowed pool1's handle still holds a valid dataset.
+        assert!(held1.dataset().raster_size().0 > 0, "borrowed handle alive");
+
+        drop(handle2);
+        drop(held1);
+        // Both pools are now fully idle: pool1 holds one handle, pool2 one.
+        // One reclaim pass frees both.
+        assert_eq!(cache.reclaim_idle().await, BASE_COST_BYTES * 2);
+        assert!(!cache.contains_key(&p1), "fully idle pool is evicted");
+        assert!(!cache.contains_key(&p2), "fully idle pool is evicted");
         assert_eq!(cache.weighted_size(), 0);
     }
 
