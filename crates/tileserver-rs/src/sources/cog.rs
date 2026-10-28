@@ -180,12 +180,18 @@ impl CogSource {
                 .await?
         };
 
+        // Acquire the handle HERE, on the async thread, so a budget refusal can
+        // be answered by evicting idle pools and retrying. `acquire_blocking`
+        // alone cannot do that: reclamation awaits moka's maintenance, which a
+        // blocking task must not drive. A `PooledHandle` is `Send`, so the
+        // acquired handle moves into the blocking render unchanged.
+        let handle = dataset_cache::global()
+            .acquire_with_reclaim(&render_pool)
+            .await?;
+
         let png_data = tokio::task::spawn_blocking(move || {
-            // Borrow a handle from the pool for the duration of the render,
-            // then return it. Borrowing (and returning) inside the blocking
-            // task is what lets concurrent renders at this level proceed in
-            // parallel.
-            let handle = render_pool.acquire_blocking()?;
+            // Render from the handle borrowed above, then return it to the
+            // pool on drop.
             render_tile_from_dataset(
                 handle.dataset(),
                 minx,

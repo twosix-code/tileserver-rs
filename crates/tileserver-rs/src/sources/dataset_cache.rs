@@ -54,7 +54,7 @@
 //! the clone into `tokio::task::spawn_blocking` and acquire a handle there.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
@@ -154,18 +154,20 @@ impl Drop for PooledHandle {
 
 impl Drop for Pool {
     fn drop(&mut self) {
-        // Release the byte budget held by any handles the pool still owns at
-        // eviction time (TTL or `invalidate`). Without this the idle handles
-        // close but `live * cost_bytes` stays in the cache's live-bytes
-        // counter, so the budget fills up and stays full and the server stops
-        // opening datasets after a while. `live` here counts only handles the
-        // pool still owns.
+        // Release the byte budget held by any handles the pool still owns.
+        //
+        // This is the *last-resort* release: it only runs when the final
+        // `Arc<Pool>` dies. `reclaim_idle` calls [`Pool::release_budget`]
+        // directly, so a pool evicted from the cache while a caller still
+        // holds an `Arc` refunds immediately instead of waiting for that
+        // caller to finish. The `budget_released` flag makes whichever
+        // happens first authoritative, so the counter is debited exactly
+        // once no matter the order.
         let live = self
             .state
             .get_mut()
             .map_or_else(|e| e.into_inner().live, |s| s.live);
-        self.live_bytes
-            .fetch_sub(live as u64 * self.cost_bytes, Ordering::AcqRel);
+        self.release_budget(live);
     }
 }
 
@@ -223,6 +225,17 @@ pub struct Pool {
     path: String,
     /// Open options (e.g. `OVERVIEW_LEVEL=N`) to open new handles with.
     open_options: Vec<String>,
+    /// Set once this pool's bytes have been refunded to `live_bytes`.
+    ///
+    /// Refund must happen exactly once, and must NOT depend on `Arc` lifetime:
+    /// `Drop for Pool` fires only when the last `Arc<Pool>` dies, but a caller
+    /// can hold its own `Arc` (or a `PooledHandle`) long after the cache has
+    /// evicted the pool. Tying the refund to `Drop` therefore defers — and in
+    /// the reclaim path silently skips — the release, so the global counter
+    /// stays inflated and the budget never frees. [`Pool::release_budget`]
+    /// uses this flag so whoever releases first wins and the accounting is
+    /// exact either way.
+    budget_released: AtomicBool,
 }
 
 /// Mutable pool state, guarded by a single mutex.
@@ -256,6 +269,7 @@ impl Pool {
             live_bytes,
             path,
             open_options,
+            budget_released: AtomicBool::new(false),
         }
     }
 
@@ -270,6 +284,43 @@ impl Pool {
     #[must_use]
     pub fn live_handles(&self) -> usize {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).live
+    }
+
+    /// Refund `live` handles worth of bytes to the shared counter — **once**.
+    ///
+    /// Both `Drop for Pool` (last `Arc` dying) and `DatasetCache::reclaim_idle`
+    /// (eviction) call this. The `budget_released` flag makes the first caller
+    /// authoritative so the counter is debited exactly once. Without the flag
+    /// the two paths would double-refund, driving the counter *below* reality
+    /// and letting the cache silently overshoot its budget.
+    ///
+    /// Takes `live` explicitly rather than reading the state lock: `Drop`
+    /// already holds the state via `get_mut`, and locking there would deadlock
+    /// a pool whose mutex is poisoned.
+    fn release_budget(&self, live: usize) {
+        if self.budget_released.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.live_bytes
+            .fetch_sub(live as u64 * self.cost_bytes, Ordering::AcqRel);
+    }
+
+    /// Refund this pool's *idle* handles' bytes, if the pool is reclaimed.
+    ///
+    /// Returns the number of bytes refunded (0 if the pool was not fully idle
+    /// or was already released). Only fully idle pools are released: a pool
+    /// with a borrowed handle must keep its bytes counted, because the handle
+    /// is still in use and will come back to a pool that is still live.
+    fn release_if_idle(&self) -> u64 {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let live = state.live;
+        if live == 0 || state.idle.len() != live {
+            return 0;
+        }
+        let bytes = live as u64 * self.cost_bytes;
+        drop(state);
+        self.release_budget(live);
+        bytes
     }
 
     /// Acquire a handle for one render, given an `Arc<Pool>` so the returned
@@ -314,6 +365,23 @@ impl Pool {
     /// been returned between the fast-path check in [`Self::acquire_arc`] and
     /// this blocking task starting.
     pub(crate) fn acquire_blocking(self: &Arc<Self>) -> Result<PooledHandle> {
+        // Budget-fit precheck. The per-pool `limit` (one handle per hardware
+        // thread) is *not* derived from the byte budget, so a single pool can
+        // ask for more bytes than the whole cache is allowed to hold. Left
+        // unchecked that is not merely a slow path — it is a permanent
+        // lockout: `reserve_budget` would refuse forever, and once this pool
+        // holds nothing (`live == 0`) there is no handle to wait for, so every
+        // later render returns an error. Refuse *before* taking the state lock
+        // so the caller gets a precise, actionable message instead.
+        if self.max_bytes > 0 && self.cost_bytes > self.max_bytes {
+            return Err(TileServerError::BudgetExhausted {
+                path: self.path.clone(),
+                cost_bytes: self.cost_bytes,
+                max_bytes: self.max_bytes,
+                live_bytes: self.live_bytes.load(Ordering::Acquire),
+            });
+        }
+
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             // 1. Reuse a free handle.
@@ -344,20 +412,35 @@ impl Pool {
                 }
             }
 
-            // 2b. The budget refused the open and *nothing is live* — no
-            //     handle exists that could later be returned, so waiting on
-            //     the condvar would block forever. This is the case where the
-            //     byte budget is smaller than a single handle's cost (or the
-            //     cache budget is already exhausted with no pool handle to
-            //     borrow from). Return an error rather than deadlock.
+            // 2b. Nothing idle and the byte budget refused the open.
+            //
+            //     Two distinct cases, and conflating them is what turned a
+            //     per-thread guard into a process-wide outage:
+            //
+            //     (i) `live > 0`. This pool holds handles that are merely
+            //         borrowed. Waiting is correct: a render finishes, drops
+            //         its `PooledHandle`, and notifies us.
+            //
+            //     (ii) `live == 0` and the cache's *global* total is
+            //          genuinely occupied by **other** pools. Nothing this
+            //          pool can wait for will ever free, so the condvar
+            //          would park forever. The old code errored here, which
+            //          bricked the server: a mosaic holding the whole budget
+            //          made every other source fail permanently. Return the
+            //          dedicated `BudgetExhausted` signal so the caller can
+            //          reclaim from other pools and retry.
             if state.live == 0 {
-                return Err(TileServerError::RasterError(format!(
-                    "byte budget exhausted for {}: cannot open handle costing {} bytes (max {} bytes, {} live)",
-                    self.path,
-                    self.cost_bytes,
-                    self.max_bytes,
-                    self.live_bytes.load(Ordering::Acquire),
-                )));
+                let live_total = self.live_bytes.load(Ordering::Acquire);
+                // Drop the state lock first: reclaiming evicts *other* pools,
+                // and their `Drop` takes their own state lock. Holding ours
+                // across that is a lock-order hazard for no benefit.
+                drop(state);
+                return Err(TileServerError::BudgetExhausted {
+                    path: self.path.clone(),
+                    cost_bytes: self.cost_bytes,
+                    max_bytes: self.max_bytes,
+                    live_bytes: live_total,
+                });
             }
 
             // 3. At a bound: wait for a handle to be returned. `wait` releases
@@ -533,6 +616,55 @@ impl DatasetCache {
         self.get_or_open_cached(path, path, &[]).await
     }
 
+    /// Acquire a handle from `pool`, reclaiming idle pools if the cache's byte
+    /// budget is exhausted.
+    ///
+    /// [`Pool::acquire_blocking`] is synchronous and cannot reclaim on its own
+    /// (reclamation awaits moka's maintenance). This wrapper is the async-side
+    /// retry:
+    ///
+    /// 1. Fast path — try the acquire; on success, done.
+    /// 2. On [`TileServerError::BudgetExhausted`], evict the cache's fully idle
+    ///    pools and try once more. That is the common case in the field: one
+    ///    STAC mosaic fills the budget with pools it is no longer rendering
+    ///    from.
+    /// 3. Still exhausted, or the budget cannot fit even one handle — surface
+    ///    the error. It maps to `503`, not `500`: the condition is resource
+    ///    pressure, not a defect in the request.
+    ///
+    /// Reclaim runs on the async thread, so the blocking acquire is spawned as
+    /// usual and the retry happens between attempts rather than inside one.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying raster error if the handle cannot be opened even
+    /// after reclaiming.
+    pub async fn acquire_with_reclaim(&self, pool: &Arc<Pool>) -> Result<PooledHandle> {
+        // Note: this function cannot call `acquire_arc` and retry it directly,
+        // because `PooledHandle` borrows no cache state — only the pool. That
+        // is exactly what makes the retry safe: a failed acquire leaves the
+        // pool unchanged, so a second attempt is a clean retry.
+        match pool.acquire_arc().await {
+            Ok(handle) => Ok(handle),
+            Err(TileServerError::BudgetExhausted { .. }) => {
+                let reclaimed = self.reclaim_idle().await;
+                if reclaimed == 0 {
+                    // Nothing idle to give back. Re-running the acquire would
+                    // just reproduce the same error, so retry only when the
+                    // reclaim actually freed budget.
+                    return Err(TileServerError::BudgetExhausted {
+                        path: pool.path.clone(),
+                        cost_bytes: pool.cost_bytes,
+                        max_bytes: pool.max_bytes,
+                        live_bytes: self.live_bytes.load(Ordering::Acquire),
+                    });
+                }
+                pool.acquire_arc().await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Fetch a pool for `key`, opened with `open_options`.
     ///
     /// Used by [`super::cog::CogSource`] to cache overview-level-opened
@@ -586,6 +718,57 @@ impl DatasetCache {
     #[must_use]
     pub fn weighted_size(&self) -> u64 {
         self.live_bytes.load(Ordering::Acquire)
+    }
+
+    /// Evict every cached pool whose handles are all **idle**, and return how
+    /// many bytes that reclaimed.
+    ///
+    /// This is the escape hatch for the budget lockout described on
+    /// [`crate::error::TileServerError::BudgetExhausted`]: when one source (a
+    /// STAC mosaic, typically) fills the whole budget with pools it is not
+    /// currently rendering from, every *other* source is refused. Before this
+    /// method existed the refusal was terminal and the process served 503s
+    /// until it was restarted.
+    ///
+    /// Only **fully idle** pools are evicted. A pool with a currently borrowed
+    /// handle is left alone: evicting it would orphan that handle's bytes (its
+    /// `Drop` refunds `live * cost_bytes` including the borrowed handle, which
+    /// then returns to a pool no longer in the cache). Idle pools are exactly
+    /// the ones whose bytes no in-flight render depends on, so reclaiming them
+    /// is safe.
+    ///
+    /// Called from the error path, so this must not block on a render. It only
+    /// takes `try_lock`-free state locks (each pool's mutex is only ever held
+    /// across a push/pop) and awaits moka's maintenance inline.
+    pub async fn reclaim_idle(&self) -> u64 {
+        // Snapshot candidates first: `iter()` borrows the cache, and we must
+        // not hold that borrow across the awaits below.
+        let candidates: Vec<(String, Arc<Pool>)> =
+            self.inner.iter().map(|(k, v)| (k.to_string(), v)).collect();
+
+        let mut reclaimed = 0u64;
+        for (key, pool) in candidates {
+            // Refund first, then evict. `release_if_idle` is a no-op for pools
+            // with borrowed handles, which are exactly the ones we must not
+            // touch. The refund is explicit rather than left to `Drop for Pool`
+            // because this loop's snapshot and any caller-held `Arc<Pool>` keep
+            // the pool alive after eviction — so `Drop` would not run here and
+            // the budget would stay inflated (the original defect).
+            let bytes = pool.release_if_idle();
+            if bytes == 0 {
+                continue;
+            }
+            self.inner.invalidate(&key).await;
+            drop(pool);
+            reclaimed = reclaimed.saturating_add(bytes);
+        }
+
+        if reclaimed > 0 {
+            // Let moka finish its eviction bookkeeping now that the pools are
+            // actually freed.
+            self.inner.run_pending_tasks().await;
+        }
+        reclaimed
     }
 }
 
@@ -741,10 +924,106 @@ mod tests {
         let cache = DatasetCache::with_max_bytes(0, Duration::from_secs(60), budget);
         let pool = cache.get_or_open(&p).await.expect("pool");
         assert!(
-            pool.acquire_arc().await.is_err(),
-            "opening past the byte budget must be refused"
+            matches!(
+                pool.acquire_arc().await,
+                Err(TileServerError::BudgetExhausted { .. })
+            ),
+            "opening past the byte budget must be refused with BudgetExhausted"
         );
         assert_eq!(pool.live_handles(), 0, "no handle leaked past the budget");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn budget_too_small_for_one_handle_is_still_recoverable() {
+        // When one handle costs more than the whole budget the pool can never
+        // open and `live` stays 0 forever, so the caller is refused forever.
+        // That is a misconfiguration, and it must still surface as
+        // `BudgetExhausted` rather than a generic raster error: the reclaim
+        // retry then finds nothing to free and reports the same signal, so the
+        // operator sees one consistent, actionable message (503, not 500).
+        let Some((_dir, p)) = tiny_gtiff("tiny.tif") else {
+            return;
+        };
+        let budget = BASE_COST_BYTES - 1;
+        let cache = DatasetCache::with_max_bytes(0, Duration::from_secs(60), budget);
+        let pool = cache.get_or_open(&p).await.expect("pool");
+        let err = match pool.acquire_arc().await {
+            Ok(_) => panic!("must be refused"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, TileServerError::BudgetExhausted { .. }),
+            "an unfittable handle must report BudgetExhausted, got: {err}"
+        );
+        // Reclaiming cannot help — the budget is not held by anyone else.
+        assert_eq!(cache.reclaim_idle().await, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reclaim_idle_frees_budget_for_another_source() {
+        // Regression for the production lockout: one source fills the whole
+        // byte budget with pools it is no longer rendering from, and every
+        // other source is refused forever. `reclaim_idle` must hand the
+        // budget back so the second source can open.
+        let Some((_dir1, p1)) = tiny_gtiff("first.tif") else {
+            return;
+        };
+        let Some((_dir2, p2)) = tiny_gtiff("second.tif") else {
+            return;
+        };
+        // Budget fits exactly one base handle.
+        let cache = DatasetCache::with_max_bytes(0, Duration::from_secs(60), BASE_COST_BYTES);
+
+        let pool1 = cache.get_or_open(&p1).await.expect("pool1");
+        {
+            // Hold and release, so pool1 owns one *idle* handle and its bytes.
+            let _h = pool1.acquire_arc().await.expect("acquire pool1");
+        }
+        assert_eq!(cache.weighted_size(), BASE_COST_BYTES, "budget is full");
+
+        // A second source cannot open: the budget is entirely pool1's.
+        let pool2 = cache.get_or_open(&p2).await.expect("pool2");
+        assert!(
+            matches!(
+                pool2.acquire_arc().await,
+                Err(TileServerError::BudgetExhausted { .. })
+            ),
+            "second source must be refused while the budget is full"
+        );
+
+        // Reclaiming the idle pool frees the budget...
+        let reclaimed = cache.reclaim_idle().await;
+        assert_eq!(reclaimed, BASE_COST_BYTES, "idle pool's bytes are freed");
+        assert_eq!(cache.weighted_size(), 0, "budget is released");
+
+        // ...and the second source now opens. This is the behaviour the old
+        // hard-error path made impossible: the server was stuck on 500s until
+        // restarted.
+        let handle2 = pool2.acquire_arc().await.expect("acquire after reclaim");
+        assert_eq!(cache.weighted_size(), BASE_COST_BYTES);
+        drop(handle2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reclaim_idle_skips_pools_with_borrowed_handles() {
+        // Evicting a pool with a borrowed handle would orphan that handle: the
+        // pool's `Drop` refunds `live * cost_bytes` (including the borrowed
+        // one), and the handle then returns to a pool no longer in the cache.
+        // `reclaim_idle` must therefore leave busy pools alone.
+        let Some((_dir, p)) = tiny_gtiff("busy.tif") else {
+            return;
+        };
+        let cache = DatasetCache::with_max_bytes(0, Duration::from_secs(60), BASE_COST_BYTES);
+        let pool = cache.get_or_open(&p).await.expect("pool");
+
+        let held = pool.acquire_arc().await.expect("acquire");
+        assert_eq!(cache.reclaim_idle().await, 0, "busy pool is not evicted");
+        assert_eq!(cache.weighted_size(), BASE_COST_BYTES, "budget untouched");
+
+        drop(held);
+        // Now fully idle, so it becomes reclaimable.
+        assert_eq!(cache.reclaim_idle().await, BASE_COST_BYTES);
+        assert_eq!(cache.weighted_size(), 0);
     }
 
     #[tokio::test]

@@ -67,6 +67,22 @@ pub enum TileServerError {
     #[error("raster error: {0}")]
     RasterError(String),
 
+    /// The dataset cache's whole byte budget is held by *other* pools, so a
+    /// handle could not be reserved and this pool has none of its own to wait
+    /// for. Distinct from [`Self::RasterError`] because it is recoverable:
+    /// evicting the least-recently-used idle pools frees budget and the open
+    /// can be retried. Callers that do not retry still get a clear message.
+    #[cfg(feature = "raster")]
+    #[error(
+        "dataset cache byte budget exhausted for {path}: cannot open handle costing {cost_bytes} bytes (max {max_bytes} bytes, {live_bytes} live)"
+    )]
+    BudgetExhausted {
+        path: String,
+        cost_bytes: u64,
+        max_bytes: u64,
+        live_bytes: u64,
+    },
+
     #[cfg(feature = "postgres")]
     #[error("PostgreSQL error: {0}")]
     PostgresError(String),
@@ -183,6 +199,10 @@ impl IntoResponse for TileServerError {
             #[cfg(feature = "raster")]
             TileServerError::RasterError(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())
+            }
+            #[cfg(feature = "raster")]
+            TileServerError::BudgetExhausted { .. } => {
+                (StatusCode::SERVICE_UNAVAILABLE, self.to_string())
             }
             #[cfg(feature = "postgres")]
             TileServerError::PostgresError(_) => {
