@@ -68,10 +68,16 @@ pub enum TileServerError {
     RasterError(String),
 
     /// The dataset cache's whole byte budget is held by *other* pools, so a
-    /// handle could not be reserved and this pool has none of its own to wait
-    /// for. Distinct from [`Self::RasterError`] because it is recoverable:
-    /// evicting the least-recently-used idle pools frees budget and the open
-    /// can be retried. Callers that do not retry still get a clear message.
+    /// cached handle could not be reserved and this pool has none of its own
+    /// to wait for.
+    ///
+    /// This is an **internal coordination signal**, not a tile error:
+    /// [`crate::sources::dataset_cache::DatasetCache::acquire_with_reclaim`]
+    /// catches it, reclaims idle bytes, waits briefly, then falls back to an
+    /// uncounted one-shot open — so it never reaches the HTTP layer from the
+    /// tile path. It survives as a variant because the reclaim/fallback logic
+    /// needs a distinct signal to escalate on; the `503` mapping is only a
+    /// defensive net.
     #[cfg(feature = "raster")]
     #[error(
         "dataset cache byte budget exhausted for {path}: cannot open handle costing {cost_bytes} bytes (max {max_bytes} bytes, {live_bytes} live)"
@@ -202,6 +208,10 @@ impl IntoResponse for TileServerError {
             }
             #[cfg(feature = "raster")]
             TileServerError::BudgetExhausted { .. } => {
+                // Defensive net only. `acquire_with_reclaim` swallows this on
+                // the tile path (reclaim -> bounded wait -> one-shot fallback),
+                // so a tile response should never reach here. Kept so a
+                // hypothetical leak maps to a resource-pressure 503, not a 500.
                 (StatusCode::SERVICE_UNAVAILABLE, self.to_string())
             }
             #[cfg(feature = "postgres")]

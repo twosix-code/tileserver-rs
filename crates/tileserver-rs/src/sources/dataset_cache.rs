@@ -31,7 +31,7 @@
 //!
 //! # Why byte-weighted
 //!
-//! This cache is bounded by an estimated **byte budget**, not by an entry
+//! This cache *retains* up to an estimated **byte budget**, not an entry
 //! count. A remote `/vsicurl/` COG is not one cheap handle: `CogSource`
 //! opens one dataset per `OVERVIEW_LEVEL` (a COG with 8 overviews yields up
 //! to 9 entries for a single source), each pool may hold several handles, and
@@ -41,10 +41,16 @@
 //! *total* retained size bounded regardless of how many overview levels a
 //! client visits or how many handles each pool grows to.
 //!
-//! The byte budget is **enforced**, not merely measured: [`Pool::acquire`]
-//! refuses to open a new handle once the process-wide live byte total would
-//! exceed the budget (see [`Pool::reserve_budget`]). A pool therefore never
-//! grows past the budget even under a burst of concurrent tiles at one zoom.
+//! The budget governs what the cache **retains and reuses**, never whether a
+//! tile renders. [`Pool::acquire`] declines to open a new *cached* handle once
+//! the process-wide live byte total would exceed the budget (see
+//! [`Pool::reserve_budget`]), so the retained total stays bounded. But a
+//! renderable tile must always succeed: when the cache cannot hand out a
+//! counted handle, `acquire_with_reclaim` falls back to an uncounted one-shot
+//! open ([`Pool::open_uncached`]) — the pre-cache baseline — after a short
+//! bounded wait, bounded cache-wide by a semaphore. The cache is therefore
+//! never observably worse than no cache at all; it only ever speeds things up
+//! while the budget allows.
 //!
 //! # Safety
 //!
@@ -67,10 +73,15 @@ use crate::error::{Result, TileServerError};
 const DEFAULT_TTL_SECONDS: u64 = 600;
 /// Byte budget for all cached open datasets.
 ///
+/// This bounds how much the cache **retains and reuses**, not whether a tile
+/// renders: under saturation the cache falls back to uncached per-render opens
+/// exactly like the pre-cache baseline, so it is never observably worse than
+/// no cache at all — it only ever speeds things up while the budget allows.
+///
 /// Deliberately below the rendered-tile cache's own budget so the two cannot
-/// add up to a multi-GB footprint on a small host. This is the sole bound on
-/// the cache: moka has a single `max_capacity` and it is interpreted as weight
-/// when a weigher is installed (see [`DatasetCache::with_max_bytes`]).
+/// add up to a multi-GB footprint on a small host. This is the sole *retention*
+/// bound on the cache: moka has a single `max_capacity` and it is interpreted
+/// as weight when a weigher is installed (see [`DatasetCache::with_max_bytes`]).
 const DEFAULT_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Environment override for [`DEFAULT_MAX_BYTES`], in bytes.
@@ -78,10 +89,10 @@ const DEFAULT_MAX_BYTES: u64 = 256 * 1024 * 1024;
 /// A dynamic STAC mosaic opens one handle per asset, each costing
 /// [`BASE_COST_BYTES`], so an N-asset mosaic needs roughly
 /// `N * BASE_COST_BYTES` of budget to hold every asset at once. A 20-asset
-/// supercell mosaic therefore saturates the 256 MB default exactly, and any
-/// further asset fails with [`TileServerError::BudgetExhausted`] — tiles still
-/// render (the mosaic degrades to partial coverage) but the log fills with
-/// budget warnings and cold renders re-open assets constantly.
+/// supercell mosaic therefore saturates the 256 MB default exactly. It must not
+/// *fail* past that point: any further asset renders via the uncounted one-shot
+/// fallback (see [`Pool::open_uncached`]), so tiles keep rendering — they just
+/// re-open, exactly as they would without the cache.
 ///
 /// Deployments with large mosaics can raise this without a rebuild; the
 /// default stays conservative so the crate does not assume a big host.
@@ -331,8 +342,9 @@ pub struct Pool {
     /// Byte cost of one handle in this pool (same for all handles in a pool,
     /// since they share `open_options`).
     cost_bytes: u64,
-    /// Cache-wide byte budget; a new handle is refused once the cache's live
-    /// total would exceed it.
+    /// Cache-wide byte budget; a new *cached* handle is refused once the
+    /// cache's live total would exceed it. (Renders still proceed via the
+    /// uncounted one-shot fallback; see [`DatasetCache::acquire_with_reclaim`].)
     max_bytes: u64,
     /// Shared live-bytes counter owned by the [`DatasetCache`] this pool
     /// belongs to. `reserve_budget` and `Drop` read/write it, so the budget is
@@ -766,9 +778,14 @@ impl DatasetCache {
         }
     }
 
-    /// Create a cache bounded by a total estimated-weight budget of
-    /// `max_bytes`. When `max_bytes == 0` the cache falls back to an
-    /// entry-count bound of `capacity` entries (legacy behaviour).
+    /// Create a cache whose *retained* estimated-weight budget is `max_bytes`.
+    /// When `max_bytes == 0` the cache falls back to an entry-count bound of
+    /// `capacity` entries (legacy behaviour).
+    ///
+    /// The budget bounds retention, not liveness: once it is full, further
+    /// renders fall back to uncounted one-shot opens
+    /// ([`Pool::open_uncached`]) rather than failing, so a smaller budget only
+    /// costs reopen latency — it never refuses a tile.
     ///
     /// Note moka has a **single** `max_capacity`. With a weigher installed it
     /// is interpreted as weight units, so the byte budget is the only active
@@ -959,10 +976,17 @@ impl DatasetCache {
         self.inner.entry_count()
     }
 
-    /// Whether a specific key is currently cached (used by observability to
-    /// confirm a `{path}#ovr{n}` pool was created).
+    /// Whether a specific key is currently cached (used by tests to confirm a
+    /// `{path}#ovr{n}` pool was created).
+    ///
+    /// `#[cfg(test)]`: the cache's public surface is quota/observability
+    /// (`weighted_size`, `entry_count`, `reclaim_idle`); key-level probing is
+    /// an implementation detail only the tests need, so it is compiled out of
+    /// the published API entirely. (`pub(crate)` would still trip
+    /// `dead_code` in a non-test build, since the only caller is a test.)
+    #[cfg(test)]
     #[must_use]
-    pub fn contains_key(&self, key: &str) -> bool {
+    pub(crate) fn contains_key(&self, key: &str) -> bool {
         self.inner.contains_key(key)
     }
 
@@ -978,12 +1002,14 @@ impl DatasetCache {
     /// Evict every cached pool whose handles are all **idle**, and return how
     /// many bytes that reclaimed.
     ///
-    /// This is the escape hatch for the budget lockout described on
-    /// [`crate::error::TileServerError::BudgetExhausted`]: when one source (a
-    /// STAC mosaic, typically) fills the whole budget with pools it is not
-    /// currently rendering from, every *other* source is refused. Before this
-    /// method existed the refusal was terminal and the process served 503s
-    /// until it was restarted.
+    /// This is the escape hatch for budget saturation: when one source (a
+    /// STAC mosaic, typically) fills the whole retained budget with pools it is
+    /// not currently rendering from, every *other* source would be refused a
+    /// counted handle. Reclaim hands those idle bytes back so the other source
+    /// can cache again. (Refusal is no longer terminal even without reclaim —
+    /// [`DatasetCache::acquire_with_reclaim`] falls back to an uncounted
+    /// one-shot open — but reclaiming keeps the cache doing useful work rather
+    /// than degrading to uncached opens.)
     ///
     /// Only **fully idle** pools are evicted. A pool with a currently borrowed
     /// handle is left alone: evicting it would orphan that handle's bytes (its
@@ -1049,9 +1075,11 @@ static GLOBAL: OnceLock<DatasetCache> = OnceLock::new();
 
 /// Access the process-global [`DatasetCache`].
 ///
-/// Lazily initialises with a 10-minute TTL and a **byte-bounded** capacity of
-/// [`DEFAULT_MAX_BYTES`]. Byte-bounding is what keeps a remote-COG source
-/// (which opens one dataset per overview level) from pinning gigabytes.
+/// Lazily initialises with a 10-minute TTL and a retained-byte budget of
+/// [`DEFAULT_MAX_BYTES`]. The budget bounds what the cache *holds*, not what it
+/// serves: once it is full, new renders fall back to uncached opens instead of
+/// failing, so the budget keeps a remote-COG source (which opens one dataset
+/// per overview level) from pinning gigabytes without ever gating a tile.
 pub fn global() -> &'static DatasetCache {
     GLOBAL.get_or_init(|| {
         let max_bytes = resolve_max_bytes();
