@@ -60,6 +60,7 @@ use std::time::Duration;
 
 use gdal::{Dataset, DatasetOptions};
 use moka::future::Cache;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::error::{Result, TileServerError};
 
@@ -136,6 +137,30 @@ fn pool_limit() -> usize {
         .unwrap_or(1)
 }
 
+/// How long `acquire_with_reclaim` waits for a handle to be *returned* before
+/// falling back to an uncounted one-shot open.
+///
+/// The common case is transient saturation: a render finishes and returns its
+/// handle a moment later, so a short wait turns an uncounted open into a cheap
+/// cache hit. It must stay short — this is added to every budget-exhausted
+/// tile's tail latency — hence the reviewer's suggested 50-100 ms window.
+const ONE_SHOT_WAIT_MS: u64 = 75;
+
+/// Cap on simultaneous **uncounted** one-shot fallback opens, cache-wide.
+///
+/// One-shot handles are deliberately not counted against the byte budget, so
+/// without a cap their number would scale with incoming concurrency and the
+/// transient peak could exceed the budget by an unbounded amount. Twice the
+/// CPU count keeps the fallback useful under a burst without letting it balloon
+/// (the reviewer's suggested `2 * CPU`). Distinct from [`pool_limit`], which
+/// bounds *counted* cached handles per key.
+fn one_shot_limit() -> usize {
+    std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1)
+        .saturating_mul(2)
+}
+
 /// Estimated byte cost of one handle opened with `open_options`.
 fn entry_cost_bytes(open_options: &[String]) -> u64 {
     let is_overview = open_options
@@ -150,15 +175,25 @@ fn entry_cost_bytes(open_options: &[String]) -> u64 {
 
 /// A handle borrowed from a [`Pool`].
 ///
-/// Dropping it returns the underlying `Dataset` to the pool's idle list (or
-/// closes it if the pool is gone). The handle's byte cost stays counted in the
-/// pool's cache while it is borrowed, and is released only when the pool
-/// itself is dropped/evicted (`Drop for Pool`). This makes release panic-safe:
-/// a render that unwinds still returns its slot, so the pool cannot leak
-/// capacity.
+/// Dropping a *pooled* handle returns the underlying `Dataset` to the pool's
+/// idle list (or closes it if the pool is gone). The handle's byte cost stays
+/// counted in the pool's cache while it is borrowed, and is released only when
+/// the pool itself is dropped/evicted (`Drop for Pool`). This makes release
+/// panic-safe: a render that unwinds still returns its slot, so the pool cannot
+/// leak capacity.
+///
+/// Dropping an *uncounted one-shot* handle (`uncached == true`) instead just
+/// closes the `Dataset` and releases its semaphore permit: it was never in the
+/// pool and never counted, so there is nothing to return.
 pub struct PooledHandle {
     dataset: Option<Dataset>,
     pool: Arc<Pool>,
+    /// True for a one-shot fallback handle: closed on drop, never returned to
+    /// the pool and never counted against the byte budget.
+    uncached: bool,
+    /// Held only for the lifetime of a one-shot handle, to bound how many
+    /// uncounted opens run at once.
+    _permit: Option<OwnedSemaphorePermit>,
 }
 
 impl PooledHandle {
@@ -169,11 +204,24 @@ impl PooledHandle {
             .as_ref()
             .expect("PooledHandle dataset taken only on drop")
     }
+
+    /// Whether this handle is an uncounted one-shot fallback (see [`Pool`]).
+    #[must_use]
+    pub fn is_uncached(&self) -> bool {
+        self.uncached
+    }
 }
 
 impl Drop for PooledHandle {
     fn drop(&mut self) {
         if let Some(dataset) = self.dataset.take() {
+            if self.uncached {
+                // One-shot fallback: close the dataset and release the permit.
+                // Nothing was counted and nothing is returned to the pool.
+                drop(dataset);
+                self._permit.take();
+                return;
+            }
             // Return the handle to the idle list and wake one waiter. The
             // handle stays open and stays counted against the byte budget
             // (`live` is NOT decremented here) — it is merely free to be
@@ -256,6 +304,10 @@ pub struct Pool {
     /// a per-cache bound rather than a process-wide one. Each pool holds a
     /// clone of the cache's `Arc`.
     live_bytes: Arc<AtomicU64>,
+    /// Cache-wide cap on simultaneous **uncounted** one-shot fallback opens.
+    /// A one-shot open acquires a permit before opening and releases it when
+    /// the handle drops. Each pool holds a clone of the cache's `Arc`.
+    one_shot_permits: Arc<Semaphore>,
     /// Path to open new handles from.
     path: String,
     /// Open options (e.g. `OVERVIEW_LEVEL=N`) to open new handles with.
@@ -283,12 +335,13 @@ struct PoolState {
 
 impl Pool {
     /// Create an empty pool for `path` opened with `open_options`, sharing the
-    /// cache's live-bytes counter `live_bytes`.
+    /// cache's live-bytes counter `live_bytes` and one-shot `one_shot_permits`.
     fn new(
         path: String,
         open_options: Vec<String>,
         max_bytes: u64,
         live_bytes: Arc<AtomicU64>,
+        one_shot_permits: Arc<Semaphore>,
     ) -> Self {
         let limit = pool_limit().max(1);
         let cost_bytes = entry_cost_bytes(&open_options);
@@ -302,6 +355,7 @@ impl Pool {
             cost_bytes,
             max_bytes,
             live_bytes,
+            one_shot_permits,
             path,
             open_options,
             budget_released: AtomicBool::new(false),
@@ -444,6 +498,8 @@ impl Pool {
                 return Ok(PooledHandle {
                     dataset: Some(dataset),
                     pool: Arc::clone(self),
+                    uncached: false,
+                    _permit: None,
                 });
             }
         }
@@ -462,15 +518,20 @@ impl Pool {
     /// blocking). It re-checks the idle list inside because a handle may have
     /// been returned between the fast-path check in [`Self::acquire_arc`] and
     /// this blocking task starting.
+    ///
+    /// This is the *counted* path only: it never opens an uncounted one-shot
+    /// handle. When it returns [`TileServerError::BudgetExhausted`] the async
+    /// caller ([`DatasetCache::acquire_with_reclaim`]) escalates — reclaim,
+    /// short wait, then a one-shot open — so a tile never fails for budget
+    /// reasons.
     pub(crate) fn acquire_blocking(self: &Arc<Self>) -> Result<PooledHandle> {
         // Budget-fit precheck. The per-pool `limit` (one handle per hardware
         // thread) is *not* derived from the byte budget, so a single pool can
         // ask for more bytes than the whole cache is allowed to hold. Left
-        // unchecked that is not merely a slow path — it is a permanent
-        // lockout: `reserve_budget` would refuse forever, and once this pool
-        // holds nothing (`live == 0`) there is no handle to wait for, so every
-        // later render returns an error. Refuse *before* taking the state lock
-        // so the caller gets a precise, actionable message instead.
+        // unchecked the loop below would spin on a reservation that can never
+        // succeed. Signal `BudgetExhausted` *before* taking the state lock so
+        // `acquire_with_reclaim` can escalate to the one-shot fallback: this
+        // pool can never be *cached*, but its tiles still render.
         if self.max_bytes > 0 && self.cost_bytes > self.max_bytes {
             return Err(TileServerError::BudgetExhausted {
                 path: self.path.clone(),
@@ -487,6 +548,8 @@ impl Pool {
                 return Ok(PooledHandle {
                     dataset: Some(dataset),
                     pool: Arc::clone(self),
+                    uncached: false,
+                    _permit: None,
                 });
             }
 
@@ -500,6 +563,8 @@ impl Pool {
                         return Ok(PooledHandle {
                             dataset: Some(dataset),
                             pool: Arc::clone(self),
+                            uncached: false,
+                            _permit: None,
                         });
                     }
                     Err(e) => {
@@ -595,6 +660,42 @@ impl Pool {
             ))
         })
     }
+
+    /// Open an **uncounted one-shot** handle: not reserved against the byte
+    /// budget, not added to `live`, never returned to the pool.
+    ///
+    /// This is the terminal fallback for `acquire_with_reclaim` once the
+    /// budget is exhausted and nothing is reclaimable. It exists because the
+    /// byte budget must never fail a renderable tile: a tile that would succeed
+    /// without the cache must succeed *with* it, so under pressure the cache
+    /// degrades to exactly the pre-cache behaviour (one uncached open per
+    /// render). It is never worse than `main`.
+    ///
+    /// The open is bounded by the cache-wide `one_shot_permits` semaphore so
+    /// uncounted handles cannot scale with incoming concurrency. The permit is
+    /// carried by the returned handle and released on drop.
+    ///
+    /// MUST run on a blocking thread (GDAL open is blocking), like
+    /// [`Self::acquire_blocking`].
+    pub(crate) async fn open_uncached(self: &Arc<Self>) -> Result<PooledHandle> {
+        // Bound concurrent uncounted opens cache-wide before touching GDAL.
+        let permit = Arc::clone(&self.one_shot_permits)
+            .acquire_owned()
+            .await
+            .map_err(|e| TileServerError::RasterError(format!("one-shot semaphore closed: {e}")))?;
+
+        let pool = Arc::clone(self);
+        let dataset = tokio::task::spawn_blocking(move || pool.open_blocking())
+            .await
+            .map_err(|e| TileServerError::RasterError(format!("task failed: {e}")))??;
+
+        Ok(PooledHandle {
+            dataset: Some(dataset),
+            pool: Arc::clone(self),
+            uncached: true,
+            _permit: Some(permit),
+        })
+    }
 }
 
 pub struct DatasetCache {
@@ -604,6 +705,10 @@ pub struct DatasetCache {
     /// pool it owns). Each pool holds a clone and reserves/releases against it
     /// via [`Pool::reserve_budget`] and `Drop for Pool`.
     live_bytes: Arc<AtomicU64>,
+    /// Cache-wide cap on simultaneous **uncounted** one-shot fallback opens.
+    /// Each pool holds a clone; a one-shot open acquires a permit for the life
+    /// of the returned handle.
+    one_shot_permits: Arc<Semaphore>,
 }
 
 impl DatasetCache {
@@ -622,6 +727,7 @@ impl DatasetCache {
             inner,
             max_bytes: 0,
             live_bytes: Arc::new(AtomicU64::new(0)),
+            one_shot_permits: Arc::new(Semaphore::new(one_shot_limit())),
         }
     }
 
@@ -660,6 +766,7 @@ impl DatasetCache {
                 inner,
                 max_bytes,
                 live_bytes: Arc::new(AtomicU64::new(0)),
+                one_shot_permits: Arc::new(Semaphore::new(one_shot_limit())),
             }
         } else {
             Self::new(capacity, ttl)
@@ -686,6 +793,7 @@ impl DatasetCache {
         let options_owned: Vec<String> = open_options.iter().map(|s| s.to_string()).collect();
         let max_bytes = self.max_bytes;
         let live_bytes = Arc::clone(&self.live_bytes);
+        let one_shot_permits = Arc::clone(&self.one_shot_permits);
 
         // `try_get_with` runs the initialiser at most once per key even under
         // concurrent misses, so two cold requests do not both build a pool
@@ -697,6 +805,7 @@ impl DatasetCache {
                     options_owned,
                     max_bytes,
                     live_bytes,
+                    one_shot_permits,
                 )))
             })
             .await
@@ -715,20 +824,29 @@ impl DatasetCache {
     }
 
     /// Acquire a handle from `pool`, reclaiming idle pools if the cache's byte
-    /// budget is exhausted.
+    /// budget is exhausted, and **never failing a renderable tile** for budget
+    /// reasons.
     ///
     /// [`Pool::acquire_blocking`] is synchronous and cannot reclaim on its own
     /// (reclamation awaits moka's maintenance). This wrapper is the async-side
-    /// retry:
+    /// escalator:
     ///
     /// 1. Fast path — try the acquire; on success, done.
-    /// 2. On [`TileServerError::BudgetExhausted`], evict the cache's fully idle
-    ///    pools and try once more. That is the common case in the field: one
-    ///    STAC mosaic fills the budget with pools it is no longer rendering
-    ///    from.
-    /// 3. Still exhausted, or the budget cannot fit even one handle — surface
-    ///    the error. It maps to `503`, not `500`: the condition is resource
-    ///    pressure, not a defect in the request.
+    /// 2. On [`TileServerError::BudgetExhausted`], evict the cache's idle
+    ///    pools (fully and partially) and try once more. That is the common
+    ///    case in the field: one STAC mosaic fills the budget with pools it is
+    ///    no longer rendering from.
+    /// 3. Still exhausted: wait a short bounded time ([`ONE_SHOT_WAIT_MS`]) for
+    ///    a handle to be *returned* (the common transient case) and try once
+    ///    more.
+    /// 4. Still nothing: open an **uncounted one-shot** handle
+    ///    ([`Pool::open_uncached`]), bounded by the cache-wide one-shot
+    ///    semaphore. The tile renders; the cache degrades to the pre-cache
+    ///    baseline rather than erroring.
+    ///
+    /// A tile must never fail because of the byte budget: whatever it would do
+    /// without the cache, it must do with the cache. The budget governs what is
+    /// *retained and reused*, not whether a render succeeds.
     ///
     /// Reclaim runs on the async thread, so the blocking acquire is spawned as
     /// usual and the retry happens between attempts rather than inside one.
@@ -736,7 +854,8 @@ impl DatasetCache {
     /// # Errors
     ///
     /// Returns the underlying raster error if the handle cannot be opened even
-    /// after reclaiming.
+    /// after reclaiming and the one-shot fallback (e.g. the file is genuinely
+    /// unreadable).
     pub async fn acquire_with_reclaim(&self, pool: &Arc<Pool>) -> Result<PooledHandle> {
         // Note: this function cannot call `acquire_arc` and retry it directly,
         // because `PooledHandle` borrows no cache state — only the pool. That
@@ -745,19 +864,22 @@ impl DatasetCache {
         match pool.acquire_arc().await {
             Ok(handle) => Ok(handle),
             Err(TileServerError::BudgetExhausted { .. }) => {
-                let reclaimed = self.reclaim_idle().await;
-                if reclaimed == 0 {
-                    // Nothing idle to give back. Re-running the acquire would
-                    // just reproduce the same error, so retry only when the
-                    // reclaim actually freed budget.
-                    return Err(TileServerError::BudgetExhausted {
-                        path: pool.path.clone(),
-                        cost_bytes: pool.cost_bytes,
-                        max_bytes: pool.max_bytes,
-                        live_bytes: self.live_bytes.load(Ordering::Acquire),
-                    });
+                // Step 2: give back idle bytes from other pools and retry.
+                if self.reclaim_idle().await > 0 {
+                    return pool.acquire_arc().await;
                 }
-                pool.acquire_arc().await
+
+                // Step 3: nothing idle to reclaim. Wait briefly for a handle
+                // to be returned — the common transient case — then retry.
+                tokio::time::sleep(Duration::from_millis(ONE_SHOT_WAIT_MS)).await;
+                match pool.acquire_arc().await {
+                    Ok(handle) => Ok(handle),
+                    // Step 4: still saturated. Fall back to an uncounted
+                    // one-shot open so the tile renders. Never worse than the
+                    // pre-cache baseline; the semaphore bounds the peak.
+                    Err(TileServerError::BudgetExhausted { .. }) => pool.open_uncached().await,
+                    Err(e) => Err(e),
+                }
             }
             Err(e) => Err(e),
         }
@@ -1032,8 +1154,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn byte_budget_is_enforced() {
-        // A budget smaller than one base handle forces the pool to refuse to
-        // open: the bound is enforced, not merely reported.
+        // The counted path refuses to open past the budget: the bound is
+        // enforced, not merely reported. (`acquire_with_reclaim` then escalates
+        // to a one-shot fallback — covered separately — so this asserts the
+        // *counted* path only.)
         let Some((_dir, p)) = tiny_gtiff("tiny.tif") else {
             return;
         };
@@ -1051,29 +1175,41 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn budget_too_small_for_one_handle_is_still_recoverable() {
-        // When one handle costs more than the whole budget the pool can never
-        // open and `live` stays 0 forever, so the caller is refused forever.
-        // That is a misconfiguration, and it must still surface as
-        // `BudgetExhausted` rather than a generic raster error: the reclaim
-        // retry then finds nothing to free and reports the same signal, so the
-        // operator sees one consistent, actionable message (503, not 500).
+    async fn budget_too_small_for_one_handle_still_renders_via_fallback() {
+        // A pool whose single handle costs more than the whole budget can never
+        // be *cached* — `acquire_arc` refuses with `BudgetExhausted` forever.
+        // But a tile must never fail for budget reasons, so
+        // `acquire_with_reclaim` must still return a usable handle via the
+        // uncounted one-shot fallback.
         let Some((_dir, p)) = tiny_gtiff("tiny.tif") else {
             return;
         };
         let budget = BASE_COST_BYTES - 1;
         let cache = DatasetCache::with_max_bytes(0, Duration::from_secs(60), budget);
         let pool = cache.get_or_open(&p).await.expect("pool");
-        let err = match pool.acquire_arc().await {
-            Ok(_) => panic!("must be refused"),
-            Err(e) => e,
-        };
+
+        // Counted path refuses.
         assert!(
-            matches!(err, TileServerError::BudgetExhausted { .. }),
-            "an unfittable handle must report BudgetExhausted, got: {err}"
+            matches!(
+                pool.acquire_arc().await,
+                Err(TileServerError::BudgetExhausted { .. })
+            ),
+            "an unfittable handle must be refused on the counted path"
         );
         // Reclaiming cannot help — the budget is not held by anyone else.
         assert_eq!(cache.reclaim_idle().await, 0);
+
+        // The escalator still delivers a renderable handle, uncounted.
+        let handle = cache
+            .acquire_with_reclaim(&pool)
+            .await
+            .expect("one-shot fallback must return a handle");
+        assert!(handle.is_uncached(), "fallback handle is uncounted");
+        assert!(handle.dataset().raster_size().0 > 0, "handle is usable");
+        assert_eq!(cache.weighted_size(), 0, "fallback handle is not counted");
+        assert_eq!(pool.live_handles(), 0, "fallback never enters the pool");
+        drop(handle);
+        assert_eq!(cache.weighted_size(), 0, "drop releases nothing counted");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1260,6 +1396,7 @@ mod tests {
             vec![],
             DEFAULT_MAX_BYTES,
             Arc::clone(&live_bytes),
+            Arc::new(Semaphore::new(one_shot_limit())),
         ));
         {
             let _h = pool.acquire_arc().await.expect("acquire");
@@ -1285,9 +1422,160 @@ mod tests {
         );
     }
 
-    #[test]
-    fn global_is_stable_across_calls() {
+    #[tokio::test]
+    async fn global_is_stable_across_calls() {
         assert!(std::ptr::eq(global(), global()));
+    }
+
+    /// Test 1 (reviewer's step 1-4): a busy source fills the budget, goes idle,
+    /// and a blocked source still gets a handle — first via reclaim, and after
+    /// everything truly drains, `weighted_size()` returns to 0.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn acquire_with_reclaim_returns_zero_after_all_handles_drop() {
+        let Some((_dir_a, pa)) = tiny_gtiff("held_by_source.tif") else {
+            return;
+        };
+        let Some((_dir_b, pb)) = tiny_gtiff("waiting_source.tif") else {
+            return;
+        };
+        // Budget fits exactly one base handle.
+        let cache = DatasetCache::with_max_bytes(0, Duration::from_secs(60), BASE_COST_BYTES);
+
+        // Pool A held in an `Arc` like a source holds it, then rendered and
+        // left idle: its handle is back in the idle list, bytes still counted.
+        let pool_a = cache.get_or_open(&pa).await.expect("pool_a");
+        {
+            let _h = cache
+                .acquire_with_reclaim(&pool_a)
+                .await
+                .expect("a renders");
+        }
+        assert_eq!(cache.weighted_size(), BASE_COST_BYTES, "budget is full");
+
+        // Pool B cannot open while A sits on the budget...
+        let pool_b = cache.get_or_open(&pb).await.expect("pool_b");
+        // ...but the reclaiming wrapper frees A's idle bytes and B renders.
+        let hb = cache
+            .acquire_with_reclaim(&pool_b)
+            .await
+            .expect("B renders after reclaim");
+        assert!(!hb.is_uncached(), "reclaim should yield a counted handle");
+
+        drop(hb);
+        // Drain A too, then a reclaim pass must free everything.
+        cache.reclaim_idle().await;
+        cache.reclaim_idle().await;
+        assert_eq!(
+            cache.weighted_size(),
+            0,
+            "once every handle has dropped, the counter returns to 0"
+        );
+        assert!(!cache.contains_key(&pa), "A is evicted once fully idle");
+    }
+
+    /// Test 2: when nothing is reclaimable (all handles busy) the fallback must
+    /// still deliver a handle, uncounted, so the tile never fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn acquire_with_reclaim_falls_back_when_all_handles_busy() {
+        let Some((_dir_a, pa)) = tiny_gtiff("busy_source.tif") else {
+            return;
+        };
+        let Some((_dir_b, pb)) = tiny_gtiff("starved_source.tif") else {
+            return;
+        };
+        let cache = DatasetCache::with_max_bytes(0, Duration::from_secs(60), BASE_COST_BYTES);
+
+        // Fill the whole budget with a *borrowed* (busy) handle so reclaim
+        // finds nothing to free.
+        let pool_a = cache.get_or_open(&pa).await.expect("pool_a");
+        let _held_a = pool_a.acquire_arc().await.expect("busy handle");
+        assert_eq!(cache.weighted_size(), BASE_COST_BYTES, "budget is full");
+
+        let pool_b = cache.get_or_open(&pb).await.expect("pool_b");
+        let hb = cache
+            .acquire_with_reclaim(&pool_b)
+            .await
+            .expect("fallback must return a handle, not fail");
+        assert!(
+            hb.is_uncached(),
+            "nothing was reclaimable, so it is one-shot"
+        );
+        assert!(
+            hb.dataset().raster_size().0 > 0,
+            "the fallback handle is usable"
+        );
+        // Uncounted: the budget still reflects only A's busy handle.
+        assert_eq!(cache.weighted_size(), BASE_COST_BYTES);
+        drop(hb);
+        assert_eq!(
+            cache.weighted_size(),
+            BASE_COST_BYTES,
+            "dropping the fallback handle releases nothing counted"
+        );
+    }
+
+    /// Test 3: a one-shot handle is uncounted, closes on drop, and releases its
+    /// semaphore permit (so a later fallback does not block behind it).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_shot_handle_is_uncounted_and_releases_its_permit() {
+        let Some((_dir, p)) = tiny_gtiff("one_shot.tif") else {
+            return;
+        };
+        let cache = DatasetCache::with_max_bytes(0, Duration::from_secs(60), DEFAULT_MAX_BYTES);
+        let pool = cache.get_or_open(&p).await.expect("pool");
+
+        let h = pool.open_uncached().await.expect("open one-shot");
+        assert!(h.is_uncached());
+        assert_eq!(cache.weighted_size(), 0, "one-shot is not counted");
+        assert_eq!(pool.live_handles(), 0, "one-shot never enters the pool");
+        drop(h);
+        assert_eq!(cache.weighted_size(), 0);
+
+        // Permit was released: a second one-shot open succeeds without
+        // blocking (capacity is >= 2 on any test host).
+        let h2 = pool.open_uncached().await.expect("permit released");
+        drop(h2);
+    }
+
+    /// Test 5: the one-shot semaphore caps concurrent uncounted opens. Uses a
+    /// dedicated cache whose semaphore is shrunk to 1 for the assertion.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn one_shot_semaphore_caps_concurrent_fallback_opens() {
+        let Some((_dir, p)) = tiny_gtiff("capped.tif") else {
+            return;
+        };
+        let mut cache = DatasetCache::with_max_bytes(0, Duration::from_secs(60), DEFAULT_MAX_BYTES);
+        // Shrink the cap to 1 so the test is deterministic and fast.
+        cache.one_shot_permits = Arc::new(Semaphore::new(1));
+        let cache = Arc::new(cache);
+
+        let pool = cache.get_or_open(&p).await.expect("pool");
+
+        // Take the only permit directly. A subsequent one-shot open must wait
+        // (not open a second uncounted handle).
+        let permit = Arc::clone(&cache.one_shot_permits)
+            .acquire_owned()
+            .await
+            .expect("permit");
+
+        let cache2 = Arc::clone(&cache);
+        let pool2 = Arc::clone(&pool);
+        let waiter = tokio::spawn(async move { pool2.open_uncached().await.map(|_| ()) });
+
+        // Give the waiter a chance to run; it must still be blocked.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiter.is_finished(), "one-shot open waits for a permit");
+
+        // Release the permit; the waiter proceeds.
+        drop(permit);
+        let opened = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("waiter must proceed once a permit frees")
+            .expect("join");
+        assert!(opened.is_ok(), "open succeeds after the permit frees");
+        // `cache2` keeps the cache strong-ref alive across the spawn, matching
+        // how a source holds its `Arc<DatasetCache>` while a render is in flight.
+        assert!(Arc::strong_count(&cache2) >= 1);
     }
 
     /// `resolve_max_bytes` must prefer a valid env override, and must fall
