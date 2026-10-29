@@ -73,7 +73,11 @@ impl CogSource {
         let bounds;
         let overview_resolutions;
         {
-            let base_handle = pool.acquire_arc().await?;
+            // Construction-time metadata read (once per source load, not per
+            // tile). Use the reclaiming wrapper so a source can still be built
+            // when the budget is momentarily saturated — a tile must never fail
+            // (and a source must never fail to load) for budget reasons.
+            let base_handle = dataset_cache::global().acquire_with_reclaim(&pool).await?;
             let (bc, b, ovr) = tokio::task::spawn_blocking(move || {
                 let guard = base_handle.dataset();
                 let band_count = guard.raster_count();

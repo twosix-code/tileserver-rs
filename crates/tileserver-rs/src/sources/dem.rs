@@ -200,9 +200,12 @@ impl DemSource {
     ) -> Result<Self> {
         let pool = Self::resolve_dataset(config, loaded).await?;
 
-        let pool_for_inspect = Arc::clone(&pool);
+        // Construction-time metadata read (once per source load, not per tile).
+        // Use the reclaiming wrapper so a source can still be built when the
+        // budget is momentarily saturated — a tile must never fail (and a
+        // source must never fail to load) for budget reasons.
+        let handle = dataset_cache::global().acquire_with_reclaim(&pool).await?;
         let bounds = tokio::task::spawn_blocking(move || {
-            let handle = pool_for_inspect.acquire_blocking()?;
             let guard = handle.dataset();
             if guard.raster_count() == 0 {
                 return Err(TileServerError::RasterError(
