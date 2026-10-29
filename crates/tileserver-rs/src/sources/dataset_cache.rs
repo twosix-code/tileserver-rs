@@ -146,6 +146,20 @@ fn pool_limit() -> usize {
 /// tile's tail latency — hence the reviewer's suggested 50-100 ms window.
 const ONE_SHOT_WAIT_MS: u64 = 75;
 
+/// Maximum idle handles a single pool retains.
+///
+/// `idle` handles are free, still-counted handles kept only so the next render
+/// at this key skips a reopen. Without a cap a single busy source that then
+/// stops rendering keeps *all* its handles counted in the cache until the TTL
+/// expires, pinning budget that another, actively-rendering source needs. On
+/// `PooledHandle::drop`, a handle returned beyond this cap is closed and its
+/// bytes refunded instead of parked in the idle list.
+///
+/// The cap is deliberately small (the reviewer's "1-2"): the win from keeping
+/// more than a couple of warm handles is marginal, and each one held is budget
+/// another pool cannot use. Only ever costs a slightly slower next acquire.
+const IDLE_CAP: usize = 2;
+
 /// Cap on simultaneous **uncounted** one-shot fallback opens, cache-wide.
 ///
 /// One-shot handles are deliberately not counted against the byte budget, so
@@ -227,10 +241,28 @@ impl Drop for PooledHandle {
             // (`live` is NOT decremented here) — it is merely free to be
             // borrowed again. It is only closed, and its cost released, when
             // the pool itself is dropped/evicted.
+            //
+            // Idle cap: a pool that has stopped rendering must not sit on the
+            // whole budget. Once the idle list is full, the returned handle is
+            // closed and its bytes refunded instead of parked. That keeps the
+            // counter honest (`live` drops with the close) and lets an
+            // actively-rendering pool reclaim those bytes on the next pass.
             let mut state = self.pool.state.lock().unwrap_or_else(|e| e.into_inner());
-            state.idle.push(dataset);
-            drop(state);
-            self.pool.returned.notify_one();
+            if state.idle.len() < IDLE_CAP {
+                state.idle.push(dataset);
+                drop(state);
+                self.pool.returned.notify_one();
+            } else {
+                // Over the cap: close it now and refund its bytes. `live` is
+                // decremented here (unlike the parked case), so the byte
+                // counter matches the handles that actually remain open.
+                state.live -= 1;
+                drop(state);
+                drop(dataset);
+                self.pool
+                    .live_bytes
+                    .fetch_sub(self.pool.cost_bytes, Ordering::AcqRel);
+            }
         }
     }
 }
@@ -267,13 +299,16 @@ impl Drop for Pool {
 ///
 /// # Bounds
 ///
-/// Two independent bounds apply, and both are enforced:
+/// Three independent bounds apply, and all are enforced:
 /// - **Concurrency**: `limit` handles at most (`available_parallelism()`).
 ///   Acquisition beyond that *waits* for a handle to be returned rather than
 ///   opening more.
 /// - **Memory**: a new handle is only opened while the process-wide live byte
 ///   total stays within the cache's byte budget. When the budget is full the
 ///   pool reuses existing handles instead of opening new ones.
+/// - **Idle retention**: at most [`IDLE_CAP`] free handles are kept idle. A
+///   pool that stops rendering closes the excess on return (refunding its
+///   bytes) rather than pinning the whole budget; a later acquire reopens.
 ///
 /// # Why a condvar and not a semaphore
 ///
@@ -1576,6 +1611,82 @@ mod tests {
         // `cache2` keeps the cache strong-ref alive across the spawn, matching
         // how a source holds its `Arc<DatasetCache>` while a render is in flight.
         assert!(Arc::strong_count(&cache2) >= 1);
+    }
+
+    /// Test 6: a pool that stops rendering must not sit on more than
+    /// [`IDLE_CAP`] handles. The excess is closed on drop and its bytes
+    /// refunded, so the cache does not hold a whole budget of warm-but-idle
+    /// handles while another source needs it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn idle_cap_closes_and_refunds_handles_beyond_the_cap() {
+        let Some((_dir, p)) = tiny_gtiff("idle_cap.tif") else {
+            return;
+        };
+        // Budget comfortably fits more than IDLE_CAP handles so the cap, not
+        // the budget, is what bounds the idle list.
+        let budget = BASE_COST_BYTES * 8;
+        let cache = DatasetCache::with_max_bytes(0, Duration::from_secs(60), budget);
+        let pool = cache.get_or_open(&p).await.expect("pool");
+
+        // Acquire IDLE_CAP + 2 handles, then drop them all. Only IDLE_CAP may
+        // remain idle; the rest are closed and refunded.
+        let wanted = IDLE_CAP + 2;
+        let mut handles = Vec::new();
+        for _ in 0..wanted {
+            handles.push(pool.acquire_arc().await.expect("acquire"));
+        }
+        assert_eq!(pool.live_handles(), wanted, "all borrowed, all counted");
+        assert_eq!(
+            cache.weighted_size(),
+            wanted as u64 * BASE_COST_BYTES,
+            "full footprint while borrowed"
+        );
+
+        drop(handles);
+
+        assert_eq!(
+            pool.live_handles(),
+            IDLE_CAP,
+            "idle list is capped at IDLE_CAP"
+        );
+        assert_eq!(
+            cache.weighted_size(),
+            IDLE_CAP as u64 * BASE_COST_BYTES,
+            "only the retained handles stay counted; the rest were refunded"
+        );
+    }
+
+    /// Regression for the reviewer's budget=4 drift: fill a pool to four
+    /// handles, drop them all, and confirm the counter returns to the true
+    /// retained footprint (closes the §3.4 accounting concern).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn counter_returns_to_zero_after_a_saturated_pool_drains() {
+        let Some((_dir, p)) = tiny_gtiff("drift.tif") else {
+            return;
+        };
+        let budget = BASE_COST_BYTES * 4;
+        let cache = DatasetCache::with_max_bytes(0, Duration::from_secs(60), budget);
+        let pool = cache.get_or_open(&p).await.expect("pool");
+
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            handles.push(pool.acquire_arc().await.expect("acquire"));
+        }
+        assert_eq!(cache.weighted_size(), budget, "all four handles counted");
+        drop(handles);
+
+        // The pool keeps at most IDLE_CAP warm handles; a reclaim pass evicts
+        // the fully-idle pool and refunds the rest, so the counter hits 0.
+        assert_eq!(
+            cache.reclaim_idle().await,
+            IDLE_CAP as u64 * BASE_COST_BYTES
+        );
+        assert!(!cache.contains_key(&p), "fully idle pool is evicted");
+        assert_eq!(
+            cache.weighted_size(),
+            0,
+            "no residual bytes after every handle has dropped"
+        );
     }
 
     /// `resolve_max_bytes` must prefer a valid env override, and must fall
