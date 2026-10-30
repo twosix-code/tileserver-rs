@@ -51,7 +51,7 @@ impl CogSource {
         let id = config.id.clone();
         let name = config.name.clone();
         let attribution = config.attribution.clone();
-        let resampling = config.resampling.unwrap_or_default();
+        let resampling = ResamplingMethod::resolve(config.resampling, config.colormap.as_ref());
         let colormap = config.colormap.clone();
 
         // Reuse a cached `Dataset` when the same path (local or /vsicurl/)
@@ -145,7 +145,7 @@ impl CogSource {
                     maxy,
                     tile_size,
                     band_count,
-                    resampling.into(),
+                    resampling,
                     colormap.as_ref(),
                 )
             };
@@ -369,7 +369,7 @@ fn render_tile_from_dataset(
     maxy: f64,
     tile_size: u32,
     band_count: usize,
-    resampling: ResampleAlg,
+    resampling: ResamplingMethod,
     colormap: Option<&ColorMapConfig>,
 ) -> Result<Vec<u8>> {
     let web_mercator = SpatialRef::from_epsg(3857)
@@ -451,8 +451,7 @@ fn render_tile_from_dataset(
             })?;
     }
 
-    gdal::raster::reproject(dataset, &warped)
-        .map_err(|e| TileServerError::RasterError(format!("Failed to reproject/warp: {}", e)))?;
+    crate::sources::warp::reproject(dataset, &warped, resampling)?;
 
     let mut img: RgbaImage = ImageBuffer::new(tile_size, tile_size);
 
@@ -467,7 +466,7 @@ fn render_tile_from_dataset(
                 (0, 0),
                 (tile_size as usize, tile_size as usize),
                 (tile_size as usize, tile_size as usize),
-                Some(resampling),
+                Some(ResampleAlg::from(resampling)),
             )
             .map_err(|e| TileServerError::RasterError(format!("Failed to read band: {}", e)))?;
 
@@ -490,7 +489,7 @@ fn render_tile_from_dataset(
                     (0, 0),
                     (tile_size as usize, tile_size as usize),
                     (tile_size as usize, tile_size as usize),
-                    Some(resampling),
+                    Some(ResampleAlg::from(resampling)),
                 )
                 .map_err(|e| TileServerError::RasterError(format!("Failed to read band: {}", e)))?;
 
@@ -682,7 +681,7 @@ mod tests {
             WEB_MERCATOR_EXTENT,
             256,
             4,
-            ResampleAlg::NearestNeighbour,
+            ResamplingMethod::Nearest,
             None,
         )
         .unwrap();
@@ -729,7 +728,7 @@ mod tests {
             WEB_MERCATOR_EXTENT,
             256,
             3,
-            ResampleAlg::NearestNeighbour,
+            ResamplingMethod::Nearest,
             None,
         )
         .unwrap();
@@ -774,7 +773,7 @@ mod tests {
             0.0,
             256,
             3,
-            ResampleAlg::NearestNeighbour,
+            ResamplingMethod::Nearest,
             None,
         )
         .unwrap();
@@ -786,5 +785,26 @@ mod tests {
                 "out-of-footprint pixels must stay transparent, not opaque black"
             );
         }
+    }
+
+    #[test]
+    fn render_returns_error_when_warp_fails() {
+        let ds = crate::sources::warp::tests::untransformable_source();
+        let err = render_tile_from_dataset(
+            &ds,
+            -WEB_MERCATOR_EXTENT,
+            -WEB_MERCATOR_EXTENT,
+            WEB_MERCATOR_EXTENT,
+            WEB_MERCATOR_EXTENT,
+            256,
+            1,
+            ResamplingMethod::Nearest,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, TileServerError::RasterError(m) if m.contains("GDALReprojectImage")),
+            "warp failure is surfaced, got {err:?}"
+        );
     }
 }
