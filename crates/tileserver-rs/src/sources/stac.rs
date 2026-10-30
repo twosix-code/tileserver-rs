@@ -1865,15 +1865,20 @@ max_total_items = 200
         use crate::raster::{RasterImage, encode};
         use ndarray::{Array2, Array3};
 
+        // 3-band RGB, the shape STAC COGs render as: `pack_rgba` maps an
+        // unmasked pixel to alpha 255 and a masked one to alpha 0. (A 4-band
+        // raster takes its alpha from band 4, so zeros there would read as
+        // transparent regardless of the mask — not what we want to assert.)
+
         // Fully masked (every pixel transparent) -> blank.
-        let data = Array3::<f32>::zeros((4, 8, 8));
+        let data = Array3::<f32>::zeros((3, 8, 8));
         let mask = Array2::from_elem((8, 8), true);
         let img = RasterImage::new(data, mask, None);
         let png = encode::to_png(&img).expect("encode blank png");
         assert!(is_blank_png(&png));
 
-        // At least one opaque pixel -> not blank.
-        let data = Array3::<f32>::zeros((4, 8, 8));
+        // At least one unmasked pixel -> not blank.
+        let data = Array3::<f32>::zeros((3, 8, 8));
         let mut mask = Array2::from_elem((8, 8), true);
         mask[[0, 0]] = false;
         let img = RasterImage::new(data, mask, None);
