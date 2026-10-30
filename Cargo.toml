@@ -9,7 +9,7 @@ resolver = "2"
 # this on v2.26.0, v2.26.1, v2.26.2 (each required a manual revert commit
 # restoring mbgl-sys to its 0.1.x train). Virtual workspace at root +
 # subdirectory crates => each package strategy only touches its own
-# Cargo.toml. Reference: geolith repo uses the same layout successfully.
+# Cargo.toml.
 members = ["crates/tileserver-rs", "crates/mbgl-sys"]
 
 [workspace.package]
@@ -59,7 +59,7 @@ object_store     = { version = "0.14.2", default-features = false, features = ["
 # under `russh::keys` (the standalone russh-keys crate is deprecated/merged),
 # so we only need russh + russh-sftp. `ring` crypto provider is preferred over
 # `aws-lc-rs` for build-time predictability on Linux/macOS.
-russh            = { version = "0.64.1", default-features = false, features = ["ring"] }
+russh            = { version = "0.65.0", default-features = false, features = ["ring"] }
 russh-sftp       = { version = "3.0.1", default-features = false }
 geozero          = { version = "0.15.1", features = ["with-mvt", "with-geojson"] }
 flate2           = "1.1.10"
@@ -144,6 +144,10 @@ prometheus       = "0.14.0"
 
 # Raster / GDAL (optional)
 gdal             = { version = "0.19.0", features = ["bindgen"] }
+# Direct FFI for `GDALReprojectImage`: `gdal::raster::reproject` hard-codes
+# bilinear, so the configured resampling needs the raw call (issue #1599).
+# Same crate `gdal` already depends on; the `[patch]` below pins both.
+gdal-sys         = "0.12.0"
 stac             = { version = "0.17.6", default-features = false }
 
 # PostgreSQL (optional)

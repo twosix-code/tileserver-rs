@@ -50,7 +50,7 @@ catalogs:
   default:
     '@commitlint/cli': ^21.2.4
     '@commitlint/config-conventional': ^21.2.4
-    '@iconify-json/simple-icons': ^1.2.100
+    '@iconify-json/simple-icons': ^1.2.101
     '@nuxt/eslint': ^1.17.0
     '@nuxt/eslint-config': ^1.17.0
     '@nuxt/fonts': ^1.2.0
@@ -71,7 +71,7 @@ catalogs:
     is-ci: ^4.1.0
     lint-staged: ^17.6.0
     '@lucide/vue': ^1.61.0
-    maplibre-gl: ^6.15.0
+    maplibre-gl: ^6.16.0
     motion-v: ^2.8.0
     nuxt: ^4.6.2
     oxfmt: ^0.74.0
@@ -97,7 +97,7 @@ catalogs:
     '@tanstack/ai-vue': ^1.0.0
     '@tanstack/query-db-collection': ^1.4.8
     '@tanstack/vue-db': ^0.3.12
-    '@tanstack/vue-query': ^5.104.5
+    '@tanstack/vue-query': ^5.105.0
     '@tmcw/togeojson': ^7.1.3
     '@types/geojson': ^7946.0.16
     '@types/papaparse': ^5.5.2
@@ -110,7 +110,7 @@ catalogs:
     zod: ^4.6.7
   marketing:
     ogl: ^1.0.11
-    wrangler: ^4.152.0
+    wrangler: ^4.153.0
   docs:
     '@nuxt/content': ^3.16.2
     better-sqlite3: ^13.0.3

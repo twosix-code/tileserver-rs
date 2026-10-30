@@ -32,9 +32,9 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use gdal::Dataset;
+use gdal::DriverManager;
 use gdal::raster::{Buffer, ResampleAlg};
 use gdal::spatial_ref::SpatialRef;
-use gdal::{DriverManager, raster::reproject};
 use image::{ImageBuffer, RgbaImage};
 use std::io::Cursor;
 use std::sync::Arc;
@@ -298,7 +298,7 @@ impl DemSource {
         let (minx, miny, maxx, maxy) = tile_to_web_mercator_bbox(z, x, y);
         let pool = Arc::clone(&self.pool);
         let band = self.band;
-        let resampling: ResampleAlg = self.resampling.into();
+        let resampling = self.resampling;
         let params = self.params;
 
         // Acquire on the async thread so a budget refusal can reclaim idle
@@ -361,7 +361,7 @@ fn render_dem_tile(
     maxy: f64,
     tile_size: u32,
     band: usize,
-    resampling: ResampleAlg,
+    resampling: ResamplingMethod,
     params: &EncodeParams,
 ) -> Result<Vec<u8>> {
     let web_mercator = SpatialRef::from_epsg(3857)
@@ -380,8 +380,7 @@ fn render_dem_tile(
     warped
         .set_spatial_ref(&web_mercator)
         .map_err(|e| TileServerError::RasterError(format!("failed to set SRS: {e}")))?;
-    reproject(dataset, &warped)
-        .map_err(|e| TileServerError::RasterError(format!("failed to reproject: {e}")))?;
+    crate::sources::warp::reproject(dataset, &warped, resampling)?;
 
     let src_band = dataset
         .rasterband(band)
@@ -396,7 +395,7 @@ fn render_dem_tile(
             (0, 0),
             (tile_size as usize, tile_size as usize),
             (tile_size as usize, tile_size as usize),
-            Some(resampling),
+            Some(ResampleAlg::from(resampling)),
         )
         .map_err(|e| TileServerError::RasterError(format!("failed to read band: {e}")))?;
 
@@ -629,5 +628,26 @@ mod tests {
         assert!((miny + WEB_MERCATOR_EXTENT).abs() < 1e-6);
         assert!((maxx - WEB_MERCATOR_EXTENT).abs() < 1e-6);
         assert!((maxy - WEB_MERCATOR_EXTENT).abs() < 1e-6);
+    }
+
+    #[test]
+    fn render_returns_error_when_warp_fails() {
+        let ds = crate::sources::warp::tests::untransformable_source();
+        let err = render_dem_tile(
+            &ds,
+            -WEB_MERCATOR_EXTENT,
+            -WEB_MERCATOR_EXTENT,
+            WEB_MERCATOR_EXTENT,
+            WEB_MERCATOR_EXTENT,
+            256,
+            1,
+            ResamplingMethod::Bilinear,
+            &params(DemEncoding::Terrarium, None),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, TileServerError::RasterError(m) if m.contains("GDALReprojectImage")),
+            "warp failure is surfaced, got {err:?}"
+        );
     }
 }
