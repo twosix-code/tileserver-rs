@@ -540,6 +540,70 @@ pub fn tile_to_wgs84_bbox(z: u8, x: u32, y: u32) -> [f64; 4] {
 /// # Errors
 ///
 /// Returns [`TileServerError::StacError`] on HTTP or JSON failure.
+/// Number of attempts for the first page of a bbox search (1 initial try +
+/// 2 retries). Kept small: a tile request is user-facing, so we bound the
+/// added latency rather than retry indefinitely.
+const STAC_SEARCH_MAX_ATTEMPTS: u32 = 3;
+
+/// Base backoff for the first-page retry, doubled per attempt (100 ms,
+/// 200 ms, …). Small enough to stay well inside the tile timeout, large
+/// enough to ride out a transient connection hiccup.
+const STAC_SEARCH_BACKOFF_MS: u64 = 100;
+
+/// Send the first page of a STAC `/search`, retrying transient failures with
+/// bounded exponential backoff.
+///
+/// Retries connection-level errors (no HTTP response) and retryable statuses
+/// (408, 429, 5xx). A non-retryable status (e.g. 4xx other than 408/429) is
+/// returned as-is so the caller's existing error handling applies. Exhausting
+/// the attempts returns the last error.
+async fn send_first_page_with_retry(
+    client: &reqwest::Client,
+    url: &str,
+    body: &serde_json::Value,
+) -> Result<reqwest::Response> {
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        match client.post(url).json(body).send().await {
+            Ok(resp) => {
+                let retryable = retryable_status(resp.status());
+                if !retryable || attempt >= STAC_SEARCH_MAX_ATTEMPTS {
+                    return Ok(resp);
+                }
+                tracing::warn!(
+                    attempt,
+                    max = STAC_SEARCH_MAX_ATTEMPTS,
+                    status = %resp.status(),
+                    "stac bbox search first page returned a retryable status; backing off"
+                );
+            }
+            Err(e) => {
+                if attempt >= STAC_SEARCH_MAX_ATTEMPTS {
+                    return Err(TileServerError::StacError(format!(
+                        "stac bbox search failed after {attempt} attempts: {e}"
+                    )));
+                }
+                tracing::warn!(
+                    attempt,
+                    max = STAC_SEARCH_MAX_ATTEMPTS,
+                    error = %e,
+                    "stac bbox search first page failed; backing off"
+                );
+            }
+        }
+        let backoff = STAC_SEARCH_BACKOFF_MS.saturating_mul(1u64 << (attempt - 1).min(5));
+        tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+    }
+}
+
+/// True for HTTP statuses worth retrying on a fresh bbox search.
+fn retryable_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+}
+
 pub async fn discover_assets_by_bbox(
     api_url: &str,
     collection: &str,
@@ -572,12 +636,22 @@ pub async fn discover_assets_by_bbox(
             search_body["token"] = serde_json::Value::String(token.clone());
         }
 
-        let response = client
-            .post(&search_url)
-            .json(&search_body)
-            .send()
-            .await
-            .map_err(|e| TileServerError::StacError(format!("stac bbox search failed: {e}")))?;
+        // Retry the FIRST page against transient upstream failures (connection
+        // resets / 5xx / 429) with bounded exponential backoff. The demo's
+        // white seams traced to `/search` connection-level failures on a fresh
+        // bbox — one blip used to blank the tile outright. Later pages do not
+        // retry: a partial result set is already usable, so we break instead
+        // (below) to avoid multiplying latency across many pages.
+        let response = if pages == 0 {
+            send_first_page_with_retry(&client, &search_url, &search_body).await?
+        } else {
+            client
+                .post(&search_url)
+                .json(&search_body)
+                .send()
+                .await
+                .map_err(|e| TileServerError::StacError(format!("stac bbox search failed: {e}")))?
+        };
 
         if !response.status().is_success() {
             // A failure on the FIRST page is fatal; a failure mid-pagination
@@ -720,7 +794,22 @@ async fn render_single_asset(
     };
 
     match CogSource::from_file(&cfg).await {
-        Ok(src) => src.get_tile(z, x, y).await,
+        Ok(src) => {
+            let tile = src.get_tile(z, x, y).await?;
+            // Same blank-tile guard as the mosaic path: a fully-transparent
+            // render must not be cached as a real tile (see the note in
+            // `composite_mosaic`). Dropping it lets the next request retry.
+            if let Some(ref t) = tile
+                && is_blank_png(&t.data)
+            {
+                tracing::debug!(
+                    asset_id = %asset.id,
+                    "single-asset render produced a fully-transparent tile; treating as no-tile"
+                );
+                return Ok(None);
+            }
+            Ok(tile)
+        }
         Err(e) => {
             tracing::warn!(
                 asset_id = %asset.id,
@@ -730,6 +819,21 @@ async fn render_single_asset(
             );
             Ok(None)
         }
+    }
+}
+
+/// True when an encoded PNG is fully transparent (every pixel alpha == 0).
+///
+/// Used to keep blank STAC renders out of the tile cache. A decode failure
+/// is treated as *not* blank (the tile is passed through) so the guard never
+/// silently swallows a real tile.
+fn is_blank_png(data: &[u8]) -> bool {
+    match image::load_from_memory(data) {
+        Ok(img) => {
+            let rgba = img.into_rgba8();
+            rgba.pixels().all(|p| p[3] == 0)
+        }
+        Err(_) => false,
     }
 }
 
@@ -800,6 +904,17 @@ async fn composite_mosaic(
         return Ok(None);
     }
     let finalised = method.finalize();
+
+    // A fully-transparent composite means every contributing asset rendered
+    // blank (upstream connection blips, partial coverage). Returning it as a
+    // real tile would let the manager write a blank hole into the tile cache
+    // for the whole TTL — the "first look at a new area poisons it" mechanism
+    // behind the demo's white seams. Treat it as "no tile" instead: the client
+    // keeps its old tile and the next request retries the upstream.
+    if finalised.is_fully_masked() {
+        tracing::debug!("mosaic composited to a fully-transparent tile; treating as no-tile");
+        return Ok(None);
+    }
 
     let png = encode::to_png(&finalised)
         .map_err(|e| TileServerError::StacError(format!("mosaic png encode failed: {e}")))?;
@@ -1727,5 +1842,50 @@ max_total_items = 200
         let cfg: SourceConfig = toml::from_str(toml).expect("parses");
         assert_eq!(cfg.max_items, 20);
         assert_eq!(cfg.max_total_items, 200);
+    }
+
+    #[test]
+    fn test_retryable_status_classification() {
+        use reqwest::StatusCode;
+        // Transient → retry.
+        assert!(retryable_status(StatusCode::REQUEST_TIMEOUT));
+        assert!(retryable_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(retryable_status(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(retryable_status(StatusCode::BAD_GATEWAY));
+        assert!(retryable_status(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(retryable_status(StatusCode::GATEWAY_TIMEOUT));
+        // Deterministic client errors → do not retry.
+        assert!(!retryable_status(StatusCode::BAD_REQUEST));
+        assert!(!retryable_status(StatusCode::NOT_FOUND));
+        assert!(!retryable_status(StatusCode::OK));
+    }
+
+    #[test]
+    fn test_is_blank_png_detects_fully_transparent() {
+        use crate::raster::{RasterImage, encode};
+        use ndarray::{Array2, Array3};
+
+        // Fully masked (every pixel transparent) -> blank.
+        let data = Array3::<f32>::zeros((4, 8, 8));
+        let mask = Array2::from_elem((8, 8), true);
+        let img = RasterImage::new(data, mask, None);
+        let png = encode::to_png(&img).expect("encode blank png");
+        assert!(is_blank_png(&png));
+
+        // At least one opaque pixel -> not blank.
+        let data = Array3::<f32>::zeros((4, 8, 8));
+        let mut mask = Array2::from_elem((8, 8), true);
+        mask[[0, 0]] = false;
+        let img = RasterImage::new(data, mask, None);
+        let png = encode::to_png(&img).expect("encode non-blank png");
+        assert!(!is_blank_png(&png));
+    }
+
+    #[test]
+    fn test_is_blank_png_treats_undecodable_as_not_blank() {
+        // A decode failure must NOT be swallowed as blank — the guard should
+        // pass the tile through so a real tile is never dropped.
+        assert!(!is_blank_png(b"not a png at all"));
+        assert!(!is_blank_png(&[]));
     }
 }

@@ -204,7 +204,7 @@ impl CogSource {
                 maxy,
                 tile_size,
                 band_count,
-                resampling.into(),
+                resampling,
                 colormap.as_ref(),
             )
         })
