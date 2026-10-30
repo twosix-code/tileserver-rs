@@ -17,18 +17,19 @@ use crate::sources::{TileCompression, TileData, TileFormat, TileMetadata, TileSo
 const WEB_MERCATOR_EXTENT: f64 = 20037508.342789244;
 
 pub struct CogSource {
-    /// Base (full-resolution) pool for this COG. Handles are borrowed per
-    /// render and returned to the pool on drop, so base tiles render in
-    /// parallel just like overview tiles. No `Dataset` is held here: the pool
-    /// owns the open handles.
-    base_pool: Arc<dataset_cache::Pool>,
     metadata: TileMetadata,
     default_resampling: ResamplingMethod,
     band_count: usize,
     colormap: Option<ColorMapConfig>,
-    /// COG source path — kept so we can re-open the dataset with an
+    /// COG source path. It is the `dataset_cache` key of the base pool, and
+    /// the path the overview pools (`{path}#ovr{n}`) re-open with an
     /// `OVERVIEW_LEVEL=N` open option when a low-zoom tile is smaller
-    /// than the full-resolution source.  This is the titiler/rio-tiler
+    /// than the full-resolution source.
+    ///
+    /// The source holds the path, not an `Arc<Pool>`: every render looks the
+    /// pool up in the cache (a moka hit). A held `Arc` would keep a pool alive
+    /// after reclaim or the TTL removed it from the cache, where reclaim can
+    /// never reach its idle handles again.  This is the titiler/rio-tiler
     /// `get_overview_level` optimisation; without it a z0 world tile
     /// forces GDAL to read the entire source raster.
     path: String,
@@ -61,13 +62,11 @@ impl CogSource {
         // cost that would otherwise be paid on every STAC-mosaic asset
         // render.  See `dataset_cache` for eviction policy.
         //
-        // The cache stores a *pool* per key. This source keeps an `Arc` to
-        // that pool and borrows a handle per render (base and overview alike),
-        // rather than detaching one handle for its own lifetime. Detaching
-        // would leave the pool empty after `limit` sources and defeat the
-        // cache. We borrow one handle now purely to read the metadata
-        // (band count / bounds / overview resolutions) and immediately return
-        // it to the pool.
+        // The cache stores a *pool* per key, and a render borrows one handle
+        // from it (base and overview alike). We borrow one handle now only to
+        // read the metadata (band count / bounds / overview resolutions) and
+        // return it to the pool at once. The source keeps the path, not the
+        // pool; see the `path` field.
         let pool = dataset_cache::global().get_or_open(&path).await?;
         let band_count;
         let bounds;
@@ -115,7 +114,6 @@ impl CogSource {
         };
 
         Ok(Self {
-            base_pool: pool,
             metadata,
             default_resampling: resampling,
             band_count,
@@ -130,12 +128,13 @@ impl CogSource {
         self.default_resampling
     }
 
-    /// Share this source's base pool so a wrapping source (e.g. a DEM source
-    /// whose `input_source` points here) can borrow handles from the same
-    /// cached float bands without re-opening the file.
+    /// The source path, which is also the `dataset_cache` key of the base
+    /// pool. A wrapping source (e.g. a DEM source whose `input_source` points
+    /// here) looks up the same pool with it, so it shares the cached handles
+    /// without a second open.
     #[must_use]
-    pub fn base_pool(&self) -> Arc<dataset_cache::Pool> {
-        Arc::clone(&self.base_pool)
+    pub fn path(&self) -> &str {
+        &self.path
     }
 
     pub async fn get_tile_with_resampling(
@@ -154,7 +153,6 @@ impl CogSource {
         let band_count = self.band_count;
         let colormap = self.colormap.clone();
         let path = self.path.clone();
-        let base_pool = Arc::clone(&self.base_pool);
 
         // `overview_index` of 0 means "read the full-resolution base". Any
         // other value means "read from overview level `overview_index - 1`",
@@ -174,7 +172,7 @@ impl CogSource {
         // The overview-pool cache lookup is async and runs on the async
         // runtime, before the blocking render is spawned.
         let render_pool: Arc<dataset_cache::Pool> = if overview_index == 0 {
-            base_pool
+            dataset_cache::global().get_or_open(&path).await?
         } else {
             let ovr_level = overview_index - 1;
             let ovr_arg = format!("OVERVIEW_LEVEL={ovr_level}");

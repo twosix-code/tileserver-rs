@@ -180,10 +180,12 @@ pub fn encode_pixels(values: &[f64], params: &EncodeParams) -> Vec<u8> {
 
 /// A DEM tile source: float elevation in, Terrarium/Mapbox-RGB PNG out.
 pub struct DemSource {
-    /// Pool of base handles for this DEM's source raster. Handles are
-    /// borrowed per render and returned to the pool on drop, in line with
-    /// `CogSource`. No `Dataset` is held here: the pool owns the handles.
-    pool: Arc<dataset_cache::Pool>,
+    /// GDAL path of the source raster, which is also the `dataset_cache` key
+    /// of its base pool. Each render looks the pool up and borrows a handle,
+    /// in line with `CogSource`. The source holds the path, not an
+    /// `Arc<Pool>`, so a pool that reclaim or the TTL removes from the cache
+    /// is not kept alive outside it.
+    path: String,
     metadata: TileMetadata,
     resampling: ResamplingMethod,
     band: usize,
@@ -198,7 +200,8 @@ impl DemSource {
         config: &SourceConfig,
         loaded: &std::collections::HashMap<String, Arc<dyn TileSource>>,
     ) -> Result<Self> {
-        let pool = Self::resolve_dataset(config, loaded).await?;
+        let path = Self::resolve_path(config, loaded)?;
+        let pool = dataset_cache::global().get_or_open(&path).await?;
 
         // Construction-time metadata read (once per source load, not per tile).
         // Use the reclaiming wrapper so a source can still be built when the
@@ -247,7 +250,7 @@ impl DemSource {
         };
 
         Ok(Self {
-            pool,
+            path,
             metadata,
             resampling: config.resampling.unwrap_or(ResamplingMethod::Bilinear),
             band: config.dem_band,
@@ -255,10 +258,13 @@ impl DemSource {
         })
     }
 
-    async fn resolve_dataset(
+    /// Resolve the GDAL path to read: the path of the `input_source` COG when
+    /// one is set (so both sources share one cached pool), otherwise this
+    /// source's own `path`.
+    fn resolve_path(
         config: &SourceConfig,
         loaded: &std::collections::HashMap<String, Arc<dyn TileSource>>,
-    ) -> Result<Arc<dataset_cache::Pool>> {
+    ) -> Result<String> {
         if let Some(ref input_id) = config.input_source {
             let source = loaded.get(input_id).ok_or_else(|| {
                 TileServerError::ConfigError(format!(
@@ -272,18 +278,13 @@ impl DemSource {
                     config.id
                 ))
             })?;
-            return Ok(cog.base_pool());
+            return Ok(cog.path().to_string());
         }
         // Normalise remote paths to a GDAL VSI prefix (see `cog.rs`): a bare
         // `https://…` URL would route through GDAL's curl→/vsimem full-download
         // shim instead of `/vsicurl/` range reads. Idempotent, so an explicit
         // `/vsicurl/` prefix in config passes through unchanged.
-        let path = crate::sources::to_gdal_cog_path(&config.path);
-        // The cache stores a *pool* per key. A DEM source keeps an `Arc` to
-        // that pool and borrows a handle per render, rather than detaching one
-        // handle for its own lifetime: detaching would leave the pool empty
-        // after `limit` sources and defeat the cache.
-        dataset_cache::global().get_or_open(&path).await
+        Ok(crate::sources::to_gdal_cog_path(&config.path))
     }
 
     /// Render one tile, exposed directly so the manager can request a
@@ -296,7 +297,7 @@ impl DemSource {
         tile_size: u32,
     ) -> Result<Option<TileData>> {
         let (minx, miny, maxx, maxy) = tile_to_web_mercator_bbox(z, x, y);
-        let pool = Arc::clone(&self.pool);
+        let pool = dataset_cache::global().get_or_open(&self.path).await?;
         let band = self.band;
         let resampling = self.resampling;
         let params = self.params;
