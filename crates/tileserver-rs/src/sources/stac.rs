@@ -74,6 +74,9 @@ struct DynamicConfig {
     /// Upper bound on the TOTAL number of items fetched per tile across all
     /// pages. Bounds the number of remote COG opens a single tile can trigger.
     max_total_items: usize,
+    /// Hard cap on how many assets a single tile may composite. See
+    /// [`SourceConfig::mosaic_max_assets`]; `0` means unlimited.
+    mosaic_max_assets: usize,
     /// Base SourceConfig cloned into each ad-hoc [`CogSource`].
     template: SourceConfig,
 }
@@ -130,6 +133,7 @@ impl StacSource {
                 dynamic: config.dynamic,
                 max_items: config.max_items,
                 max_total_items: config.max_total_items,
+                mosaic_max_assets: config.mosaic_max_assets,
                 stac_bbox: config.stac_bbox,
                 pixel_selection: config.pixel_selection,
                 tile_path_template: None,
@@ -170,6 +174,7 @@ impl StacSource {
                 asset_role: asset_role.to_string(),
                 max_items,
                 max_total_items: config.max_total_items,
+                mosaic_max_assets: config.mosaic_max_assets,
                 template: config.clone(),
             })
         } else {
@@ -269,6 +274,31 @@ impl StacSource {
 
         if assets.is_empty() {
             return Ok(None);
+        }
+
+        // Fan-out cap: bound how many assets a single tile opens and renders.
+        // Each open COG handle is charged a flat 16 MiB against the dataset
+        // budget, and a low-zoom tile's bbox can match dozens of items (a z6
+        // io-lulc tile matches 32: 4 supercells x 8 years). Opening them all
+        // saturates the budget, every further open is refused, and the tile
+        // renders blank — which reads as "the server went down". Capping the
+        // mosaic keeps the live handle count bounded without enlarging the
+        // cache. Assets are ranked most-relevant-first before truncating.
+        if cfg.mosaic_max_assets > 0 && assets.len() > cfg.mosaic_max_assets {
+            let capped = rank_assets_for_tile(&assets, bbox, cfg.mosaic_max_assets);
+            tracing::debug!(
+                z,
+                x,
+                y,
+                candidates = assets.len(),
+                kept = capped.len(),
+                cap = cfg.mosaic_max_assets,
+                "mosaic fan-out capped"
+            );
+            if capped.len() == 1 {
+                return render_single_asset(&capped[0], &cfg.template, z, x, y).await;
+            }
+            return composite_mosaic(&capped, &cfg.template, z, x, y).await;
         }
 
         if assets.len() == 1 {
@@ -483,6 +513,72 @@ pub fn compute_merged_bounds(assets: &[StacAsset]) -> Option<[f64; 4]> {
     Some(merged)
 }
 
+/// Select up to `max` assets for a tile, most-relevant-first.
+///
+/// Used by the mosaic fan-out cap to keep a low-zoom tile's live COG handles
+/// bounded (see [`SourceConfig::mosaic_max_assets`]). Ranking is deliberately
+/// simple and local — no extra network calls:
+///
+/// 1. Drop assets whose footprint does not intersect the tile at all (a STAC
+///    bbox search can return an item whose *declared* bbox only grazes the
+///    tile).
+/// 2. Sort by the area of the asset's intersection with the tile, descending:
+///    the contributors that cover most of the tile win, so the composite is
+///    as complete as it can be within the cap.
+/// 3. Break ties by the input order (which already reflects the collection's
+///    own ranking / pixel-selection priority), so a deterministic choice is
+///    made and the highest-priority contributor is preferred.
+///
+/// If no asset intersects (which should not happen for a bbox-matched result
+/// set), fall back to the first `max` assets in input order so a tile is never
+/// rendered empty purely because of this filter.
+#[must_use]
+fn rank_assets_for_tile(
+    assets: &[StacAsset],
+    tile_bbox: [f64; 4],
+    max: usize,
+) -> Vec<StacAsset> {
+    let mut scored: Vec<(f64, usize, &StacAsset)> = assets
+        .iter()
+        .enumerate()
+        .map(|(i, a)| (bbox_intersection_area(a.bbox, tile_bbox), i, a))
+        .filter(|(area, _, _)| *area > 0.0)
+        .collect();
+
+    if scored.is_empty() {
+        return assets.iter().take(max).cloned().collect();
+    }
+
+    // Sort by area desc, then by original index asc (stable priority order).
+    scored.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.1.cmp(&b.1))
+    });
+
+    scored
+        .into_iter()
+        .take(max)
+        .map(|(_, _, a)| a.clone())
+        .collect()
+}
+
+/// Area of the intersection of two `[west, south, east, north]` boxes.
+///
+/// Returns `0.0` when the boxes do not overlap. Longitude spans are treated
+/// naively (no antimeridian wrapping) — adequate for ranking contributors
+/// within a single tile, which never straddles ±180° in the demo.
+#[must_use]
+fn bbox_intersection_area(a: [f64; 4], b: [f64; 4]) -> f64 {
+    let west = a[0].max(b[0]);
+    let south = a[1].max(b[1]);
+    let east = a[2].min(b[2]);
+    let north = a[3].min(b[3]);
+    let w = (east - west).max(0.0);
+    let h = (north - south).max(0.0);
+    w * h
+}
+
 /// Returns `true` if the MIME type indicates a COG or GeoTIFF file.
 #[must_use]
 pub fn is_cog_mime_type(mime: &str) -> bool {
@@ -592,9 +688,30 @@ async fn send_first_page_with_retry(
                 );
             }
         }
-        let backoff = STAC_SEARCH_BACKOFF_MS.saturating_mul(1u64 << (attempt - 1).min(5));
-        tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+        let base = STAC_SEARCH_BACKOFF_MS.saturating_mul(1u64 << (attempt - 1).min(5));
+        // Jitter the backoff so a burst of concurrent callers does not retry in
+        // lockstep. Observed against the demo's upstream: five viewport tiles
+        // retried within 12 ms of each other, which re-triggers the same
+        // refusal. Spreading them desynchronises the retry wave.
+        let jitter = pseudo_jitter(base);
+        tokio::time::sleep(std::time::Duration::from_millis(base + jitter)).await;
     }
+}
+
+/// Deterministic-but-spread jitter in `[0, upper/2]` for a backoff of `upper`.
+///
+/// Derived from the current time so concurrent callers pick different values
+/// without pulling in a random-number dependency: the low bits of a nanosecond
+/// clock differ across calls made in different tasks.
+fn pseudo_jitter(upper: u64) -> u64 {
+    if upper == 0 {
+        return 0;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    nanos % (upper / 2 + 1)
 }
 
 /// True for HTTP statuses worth retrying on a fresh bbox search.
@@ -604,7 +721,90 @@ fn retryable_status(status: reqwest::StatusCode) -> bool {
         || status.is_server_error()
 }
 
+/// Grid when rounding a tile bbox before using it as a coalescing key.
+///
+/// Adjacent tiles in one viewport map to slightly different WGS-84 bboxes; the
+/// STAC search is a bbox query, so near-identical boxes return the same items.
+/// Snapping to a coarse grid lets them share one upstream call. 0.05° is small
+/// relative to a z10 tile (~0.35° wide) yet coarse enough to merge a cluster,
+/// and it far exceeds the sub-metre differences between neighbouring tiles.
+const STAC_BBOX_KEY_GRID: f64 = 0.05;
+
+/// Build the coalescing key for a bbox search.
+///
+/// Includes every parameter that affects the upstream result (api, collection,
+/// asset role, and both caps) plus the grid-snapped bbox, so two calls share a
+/// key only when the search is genuinely identical.
+#[must_use]
+fn search_cache_key(
+    api_url: &str,
+    collection: &str,
+    asset_role: &str,
+    max_items: usize,
+    max_total_items: usize,
+    bbox: [f64; 4],
+) -> String {
+    let snap = |v: f64| (v / STAC_BBOX_KEY_GRID).round() * STAC_BBOX_KEY_GRID;
+    format!(
+        "{api_url}|{collection}|{asset_role}|{max_items}|{max_total_items}|{},{},{},{}",
+        snap(bbox[0]),
+        snap(bbox[1]),
+        snap(bbox[2]),
+        snap(bbox[3]),
+    )
+}
+
+/// Discover COG assets for a bbox, coalescing identical searches.
+///
+/// This is the entry point used by the dynamic per-tile path. It routes the
+/// underlying [`search_assets_by_bbox`] through the process-global
+/// [`search_cache`], collapsing a viewport's burst of same-area searches into a
+/// single upstream request (see that module for why).
+///
+/// # Errors
+///
+/// Propagates [`TileServerError::StacError`] from the upstream search.
 pub async fn discover_assets_by_bbox(
+    api_url: &str,
+    collection: &str,
+    asset_role: &str,
+    max_items: usize,
+    max_total_items: usize,
+    bbox: [f64; 4],
+) -> Result<Vec<StacAsset>> {
+    let key = search_cache_key(
+        api_url,
+        collection,
+        asset_role,
+        max_items,
+        max_total_items,
+        bbox,
+    );
+    super::search_cache::global()
+        .get_or_search(key, || {
+            search_assets_by_bbox(
+                api_url,
+                collection,
+                asset_role,
+                max_items,
+                max_total_items,
+                bbox,
+            )
+        })
+        .await
+}
+
+/// Run the bbox search against the upstream API (uncoalesced).
+///
+/// Paginates `/search` across `links[rel=next]`, applying the retry policy to
+/// the first page. Callers should go through [`discover_assets_by_bbox`] so
+/// concurrent identical searches are coalesced.
+///
+/// # Errors
+///
+/// Returns [`TileServerError::StacError`] if the HTTP request fails, the first
+/// page returns a non-2xx status, or the response JSON is malformed.
+async fn search_assets_by_bbox(
     api_url: &str,
     collection: &str,
     asset_role: &str,
@@ -774,6 +974,7 @@ async fn render_single_asset(
         dynamic: false,
         max_items: template.max_items,
         max_total_items: template.max_total_items,
+        mosaic_max_assets: template.mosaic_max_assets,
         stac_bbox: template.stac_bbox,
         pixel_selection: template.pixel_selection,
         tile_path_template: None,

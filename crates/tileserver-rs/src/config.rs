@@ -859,6 +859,28 @@ pub struct SourceConfig {
     /// collections or when serving low zooms deliberately.
     #[serde(default = "default_stac_max_total_items")]
     pub max_total_items: usize,
+    /// Hard cap on how many STAC assets a SINGLE tile may composite into one
+    /// mosaic. Distinct from `max_total_items` (which bounds how many items a
+    /// tile *fetches*): this bounds how many of them are *opened and rendered*
+    /// at once.
+    ///
+    /// Why it exists: every open COG handle is charged a flat 16 MiB against
+    /// the dataset-cache byte budget, so the number of concurrently-live
+    /// handles is `budget / 16 MiB`. At low zoom one tile's bbox spans a
+    /// continent of supercells x years — a z6 io-lulc tile matches 32 items
+    /// (4 cells x 8 years), and a whole z6 viewport unions well past the 64
+    /// handles a 1 GiB budget allows. The mosaic then saturates the budget,
+    /// every further open is refused ("byte budget exhausted"), and the tile
+    /// comes back blank — which reads to the client as "the server went down".
+    ///
+    /// Capping the fan-out keeps a low-zoom tile's live handle count bounded
+    /// on a small host without enlarging the cache budget. Assets are chosen
+    /// by overlap with the tile (then by the pixel-selection ranking), so the
+    /// cap keeps the most relevant contributors.
+    ///
+    /// Defaults to 8. Set to `0` for unlimited (previous behaviour).
+    #[serde(default = "default_stac_mosaic_max_assets")]
+    pub mosaic_max_assets: usize,
     /// Optional WGS-84 bounding box `[west, south, east, north]` used to scope
     /// Phase 1 static discovery AND to override the merged item bounds exposed
     /// to clients. Essential when a global STAC collection would otherwise
@@ -1019,6 +1041,14 @@ fn default_stac_max_items() -> usize {
 
 fn default_stac_max_total_items() -> usize {
     64
+}
+
+/// Default cap on assets composited into a single mosaic tile (see
+/// [`SourceConfig::mosaic_max_assets`]). 8 keeps a low-zoom tile's live COG
+/// handles well under a small dataset-cache byte budget while still covering
+/// the tile with several overlapping contributors.
+fn default_stac_mosaic_max_assets() -> usize {
+    8
 }
 
 #[cfg(feature = "dem")]

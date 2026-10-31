@@ -176,7 +176,7 @@ pub async fn upload_file(
         dynamic: false,
         max_items: 100,
         max_total_items: 64,
-        stac_bbox: None,
+        mosaic_max_assets: 8,        stac_bbox: None,
         pixel_selection: crate::config::PixelSelectionMethod::First,
         tile_path_template: None,
         tms: false,

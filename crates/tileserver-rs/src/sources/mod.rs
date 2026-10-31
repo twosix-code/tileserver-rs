@@ -16,6 +16,8 @@ pub mod duckdb;
 pub mod geoparquet;
 pub mod manager;
 pub mod mbtiles;
+#[cfg(feature = "stac")]
+pub mod search_cache;
 pub mod pmtiles;
 #[cfg(feature = "postgres")]
 pub mod postgres;

@@ -632,6 +632,7 @@ mod error_handling {
             dynamic: false,
             max_items: 500,
             max_total_items: 64,
+            mosaic_max_assets: 8,
             stac_bbox: None,
             pixel_selection: tileserver_rs::config::PixelSelectionMethod::First,
             tile_path_template: None,
