@@ -420,6 +420,56 @@ pub fn extract_assets_from_item_collection(
 /// present.  Missing fields are preserved as `None` so mosaic methods
 /// that depend on them can degrade gracefully (e.g.
 /// `lowest_cloud_cover` treats `None` as worst cloud cover).
+/// Canonicalise an S3 asset href to a single host form.
+///
+/// The same object is frequently reachable under two equivalent S3 URL
+/// shapes: the *virtual-hosted* form
+/// (`https://<bucket>.s3.<region>.amazonaws.com/<key>`) and the *path-style*
+/// form (`https://s3.<region>.amazonaws.com/<bucket>/<key>`). A STAC API may
+/// return either form for the same asset, and the same COG can appear under
+/// both across a catalogue.
+///
+/// Downstream the href is used as a cache key (dataset cache, tile cache), so
+/// two spellings of one object become two cache entries: double the open
+/// handles for one COG, and no reuse between them. Canonicalising the href the
+/// moment it enters a [`StacAsset`] guarantees the same COG always maps to the
+/// same key, on every tile, in every viewport, across sessions.
+///
+/// The rewrite is deterministic and targeted: only path-style S3 HTTPS URLs
+/// whose host is exactly `s3[.<region>].amazonaws.com` are converted to the
+/// virtual-hosted form. Every other URL — including virtual-hosted S3 URLs and
+/// non-S3 hosts — is returned unchanged, so this is a no-op for catalogues
+/// that already use one consistent form.
+#[must_use]
+pub fn canonicalize_asset_href(href: &str) -> String {
+    let Some(rest) = href.strip_prefix("https://") else {
+        return href.to_string();
+    };
+    let Some((host, path)) = rest.split_once('/') else {
+        return href.to_string();
+    };
+    // Only `s3.amazonaws.com` / `s3.<region>.amazonaws.com` are path-style hosts.
+    let is_path_style_s3 =
+        host == "s3.amazonaws.com" || (host.starts_with("s3.") && host.ends_with(".amazonaws.com"));
+    if !is_path_style_s3 {
+        return href.to_string();
+    }
+    // Split the first path segment (the bucket) from the object key. An empty
+    // bucket or key means the URL is not a well-formed path-style S3 URL, so
+    // leave it untouched rather than mangling it.
+    let Some((bucket, key)) = path.split_once('/') else {
+        return href.to_string();
+    };
+    if bucket.is_empty() || key.is_empty() {
+        return href.to_string();
+    }
+    // `s3.<region>.amazonaws.com` -> `<bucket>.s3.<region>.amazonaws.com`.
+    // For the region-less `s3.amazonaws.com`, keep it region-less:
+    // `<bucket>.s3.amazonaws.com`.
+    let suffix = host.strip_prefix("s3.").unwrap_or(host);
+    format!("https://{bucket}.s3.{suffix}/{key}")
+}
+
 #[must_use]
 pub fn extract_cog_asset_from_item(item: &stac::Item, asset_role: &str) -> Option<StacAsset> {
     let bbox = item.bbox.as_ref().map(bbox_to_2d)?;
@@ -429,7 +479,7 @@ pub fn extract_cog_asset_from_item(item: &stac::Item, asset_role: &str) -> Optio
 
     Some(StacAsset {
         id: item.id.clone(),
-        href: asset.href.clone(),
+        href: canonicalize_asset_href(&asset.href),
         bbox,
         title: asset.title.clone().unwrap_or_else(|| {
             if item.id.is_empty() {
@@ -1306,6 +1356,53 @@ mod tests {
     fn test_is_stac_api_url_false() {
         assert!(!is_stac_api_url("/local/path"));
         assert!(!is_stac_api_url("s3://bucket/path"));
+    }
+
+    #[test]
+    fn test_canonicalize_asset_href_path_style_to_virtual_hosted() {
+        // The two spellings of the same object must collapse to ONE form.
+        let path_style = "https://s3.us-west-2.amazonaws.com/io-10m-annual-lulc/36U_2023.tif";
+        let virtual_hosted = "https://io-10m-annual-lulc.s3.us-west-2.amazonaws.com/36U_2023.tif";
+        assert_eq!(canonicalize_asset_href(path_style), virtual_hosted);
+        // Idempotent: canonicalising the canonical form is a no-op.
+        assert_eq!(canonicalize_asset_href(virtual_hosted), virtual_hosted);
+    }
+
+    #[test]
+    fn test_canonicalize_asset_href_regionless() {
+        assert_eq!(
+            canonicalize_asset_href("https://s3.amazonaws.com/bucket/key.tif"),
+            "https://bucket.s3.amazonaws.com/key.tif"
+        );
+    }
+
+    #[test]
+    fn test_canonicalize_asset_href_leaves_non_path_style_untouched() {
+        // Virtual-hosted S3 host (no `s3.` prefix on the host).
+        let vh = "https://io-10m-annual-lulc.s3.us-west-2.amazonaws.com/36U_2023.tif";
+        assert_eq!(canonicalize_asset_href(vh), vh);
+        // Non-S3 hosts are never rewritten.
+        for href in [
+            "https://example.com/cog.tif",
+            "https://storage.googleapis.com/bucket/cog.tif",
+            "http://s3.us-west-2.amazonaws.com/bucket/key.tif",
+            "/vsicurl/https://s3.us-west-2.amazonaws.com/bucket/key.tif",
+            "s3://bucket/key.tif",
+        ] {
+            assert_eq!(canonicalize_asset_href(href), href, "unchanged: {href}");
+        }
+    }
+
+    #[test]
+    fn test_canonicalize_asset_href_malformed_path_style_untouched() {
+        // No bucket/key boundary, or empty bucket, must not be mangled.
+        for href in [
+            "https://s3.us-west-2.amazonaws.com",
+            "https://s3.us-west-2.amazonaws.com/",
+            "https://s3.us-west-2.amazonaws.com/bucketonly",
+        ] {
+            assert_eq!(canonicalize_asset_href(href), href, "unchanged: {href}");
+        }
     }
 
     #[test]
