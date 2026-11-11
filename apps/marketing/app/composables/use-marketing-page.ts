@@ -34,6 +34,12 @@ import {
   Package,
   Mountain,
   MountainSnow,
+  Activity,
+  KeyRound,
+  Gauge,
+  Radio,
+  ScanSearch,
+  ChartLine,
 } from '@lucide/vue';
 import type {
   Feature,
@@ -91,14 +97,14 @@ export function useMarketingPage() {
       icon: MapIcon,
       title: 'Cloud Optimized GeoTIFF',
       description:
-        'Serve raster tiles from COG files with on-the-fly reprojection and colormap support.',
+        'Serve raster tiles from local or remote COG files with on-the-fly reprojection, colormaps, and the resampling you choose. Remote files use HTTP range reads, and pooled handles render tiles in parallel.',
       category: 'Data formats',
     },
     {
       icon: Mountain,
       title: 'DEM Terrain Encoding',
       description:
-        'On-the-fly Terrarium & Mapbox-RGB encoding from any GDAL elevation source: about 2× faster than titiler, ready for MapLibre hillshade & 3D terrain.',
+        'On-the-fly Terrarium & Mapbox-RGB encoding from any GDAL elevation source: about 8× faster than titiler, ready for MapLibre hillshade & 3D terrain.',
       category: 'Rendering',
     },
     {
@@ -112,7 +118,7 @@ export function useMarketingPage() {
       icon: HardDrive,
       title: 'PostgreSQL Out-DB Rasters',
       description:
-        'Dynamic VRT/COG tile serving via PostGIS functions with query-based filtering.',
+        'Dynamic VRT/COG tile serving via PostGIS functions with query-based filtering. Rebuilt files are picked up without a restart.',
       category: 'Data formats',
     },
     {
@@ -148,6 +154,27 @@ export function useMarketingPage() {
       title: 'Hot-Reload',
       description:
         'Reload configuration without downtime via SIGHUP or admin API. Zero-request-drop with ArcSwap.',
+      category: 'Developer experience',
+    },
+    {
+      icon: Radio,
+      title: 'Live Tile Updates',
+      description:
+        "A WebSocket at /ws tells every open map when a source changes: a rewritten file, a new ETag on a remote archive, or a config reload. The viewer re-fetches only that source's tiles, with no page reload.",
+      category: 'Developer experience',
+    },
+    {
+      icon: ChartLine,
+      title: 'Analytics Dashboard',
+      description:
+        'Requests per minute, cache hit rate, p50/p95/p99 latency, per-source tables, a request heatmap and the most requested tiles, in the admin UI. In-memory and bounded; off by default.',
+      category: 'Developer experience',
+    },
+    {
+      icon: ScanSearch,
+      title: 'inspect CLI',
+      description:
+        'tileserver-rs inspect prints the layers, zoom range, bounds and tile counts of a PMTiles or MBTiles file, or a remote PMTiles URL, and can decode one tile. Plain text or JSON.',
       category: 'Developer experience',
     },
     {
@@ -246,6 +273,20 @@ export function useMarketingPage() {
       title: 'Configurable Caching',
       description:
         'Per-source cache control headers with configurable max-age, stale-while-revalidate, and CDN-friendly strategies for optimal tile delivery.',
+      category: 'Developer experience',
+    },
+    {
+      icon: Activity,
+      title: 'Prometheus & OpenTelemetry',
+      description:
+        'A /metrics endpoint for Prometheus scraping, plus OTLP traces and metrics for Grafana, Jaeger or any OpenTelemetry collector.',
+      category: 'Developer experience',
+    },
+    {
+      icon: KeyRound,
+      title: 'MCP Admin UI',
+      description:
+        'Web pages on the private admin listener to list and revoke the OAuth apps and device sessions connected to the MCP server.',
       category: 'Developer experience',
     },
     {
@@ -440,6 +481,16 @@ export function useMarketingPage() {
         titiler: '✗',
       },
     },
+    {
+      feature: 'Live tile updates (WebSocket)',
+      values: {
+        'tileserver-rs': '✓',
+        martin: '✗',
+        'tileserver-gl': '✗',
+        pg_tileserv: '✗',
+        titiler: '✗',
+      },
+    },
   ];
 
   const performanceStats: PerformanceStat[] = [
@@ -470,10 +521,10 @@ export function useMarketingPage() {
     },
     {
       icon: FileArchive,
-      value: 3.5,
+      value: 11.2,
       decimals: 1,
       label: '× faster COG tiles vs titiler',
-      detail: 'World RGB COG: 337 vs 96 avg req/s',
+      detail: 'World RGB COG: 864 vs 77 avg req/s',
     },
     {
       icon: RefreshCw,
@@ -484,10 +535,16 @@ export function useMarketingPage() {
     },
     {
       icon: Mountain,
-      value: 1.9,
+      value: 8.4,
       decimals: 1,
       label: '× faster DEM terrain-RGB vs titiler',
-      detail: 'Live Terrarium encode: 276 vs 146 avg req/s',
+      detail: 'Live Terrarium encode: 1,142 vs 136 avg req/s',
+    },
+    {
+      icon: Gauge,
+      value: 11342,
+      label: 'OGC API Features req/sec',
+      detail: 'GeoJSON item pages, 11 ms avg',
     },
   ];
 

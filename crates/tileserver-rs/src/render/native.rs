@@ -6,26 +6,27 @@
 use std::ffi::{CStr, CString};
 use std::ptr;
 use std::sync::Once;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use image::ImageEncoder;
 
 use mbgl_sys::{
     MLNCameraOptions, MLNErrorCode, MLNHeadlessFrontend, MLNImageData, MLNMap, MLNMapMode,
-    MLNRenderOptions, MLNResourceCallback, MLNSize, mln_cleanup, mln_get_last_error,
-    mln_headless_frontend_create, mln_headless_frontend_destroy, mln_headless_frontend_set_size,
-    mln_image_free, mln_init, mln_map_create, mln_map_create_with_loader, mln_map_destroy,
-    mln_map_is_fully_loaded, mln_map_load_style, mln_map_render_still, mln_map_set_camera,
-    mln_map_set_size,
+    MLNRenderOptions, MLNSize, mln_get_last_error, mln_headless_frontend_create,
+    mln_headless_frontend_destroy, mln_image_free, mln_init, mln_map_create, mln_map_destroy,
+    mln_map_load_style, mln_map_render_still, mln_map_set_size,
 };
 
 use crate::error::{Result, TileServerError};
 
 static INIT: Once = Once::new();
-static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 /// Initialize the MapLibre Native library.
 /// This is called automatically when needed but can be called explicitly.
+///
+/// # Errors
+///
+/// [`TileServerError::RenderError`] when MapLibre Native fails to
+/// initialise.
 pub fn init() -> Result<()> {
     let mut result = Ok(());
 
@@ -34,28 +35,13 @@ pub fn init() -> Result<()> {
         let code = unsafe { mln_init() };
         if code != MLNErrorCode::MLN_OK {
             result = Err(TileServerError::RenderError(format!(
-                "Failed to initialize MapLibre Native: {:?}",
+                "failed to initialize MapLibre Native: {:?}",
                 get_last_error()
             )));
-        } else {
-            INITIALIZED.store(true, Ordering::Release);
         }
     });
 
     result
-}
-
-/// Cleanup the MapLibre Native library.
-/// Should be called when shutting down the application.
-#[allow(dead_code)] // Called at application shutdown; not yet wired into graceful-shutdown path
-pub fn cleanup() {
-    if INITIALIZED.load(Ordering::Acquire) {
-        // SAFETY: mln_cleanup() is safe to call once after mln_init() succeeded
-        unsafe {
-            mln_cleanup();
-        }
-        INITIALIZED.store(false, Ordering::Release);
-    }
 }
 
 /// Get the last error message from MapLibre Native.
@@ -222,6 +208,10 @@ impl RenderedImage {
     /// tiles comparable in size to tileserver-gl (~30-40 KB for a typical
     /// 512×512 map tile vs ~134 KB with the `image` crate's default Fast
     /// compression).
+    ///
+    /// # Errors
+    ///
+    /// [`TileServerError::RenderError`] when the pixels cannot be encoded.
     pub fn to_png(&self) -> Result<Vec<u8>> {
         use image::codecs::png::{CompressionType, FilterType, PngEncoder};
 
@@ -247,6 +237,10 @@ impl RenderedImage {
     }
 
     /// Convert to JPEG format
+    ///
+    /// # Errors
+    ///
+    /// [`TileServerError::RenderError`] when the pixels cannot be encoded.
     pub fn to_jpeg(&self, quality: u8) -> Result<Vec<u8>> {
         use image::{ImageBuffer, Rgb};
 
@@ -260,7 +254,7 @@ impl RenderedImage {
 
         let img: ImageBuffer<Rgb<u8>, _> = ImageBuffer::from_raw(self.width, self.height, rgb_data)
             .ok_or_else(|| {
-                TileServerError::RenderError("Failed to create image buffer".to_string())
+                TileServerError::RenderError("failed to create image buffer".to_string())
             })?;
 
         // Encode to JPEG
@@ -285,6 +279,10 @@ impl RenderedImage {
     }
 
     /// Convert to WebP format
+    ///
+    /// # Errors
+    ///
+    /// [`TileServerError::RenderError`] when the pixels cannot be encoded.
     pub fn to_webp(&self, _quality: u8) -> Result<Vec<u8>> {
         use image::codecs::webp::WebPEncoder;
 
@@ -317,6 +315,11 @@ unsafe impl Send for HeadlessFrontend {}
 
 impl HeadlessFrontend {
     /// Create a new headless frontend
+    ///
+    /// # Errors
+    ///
+    /// [`TileServerError::RenderError`] when the native frontend cannot be
+    /// created.
     pub fn new(size: Size, pixel_ratio: f32) -> Result<Self> {
         init()?;
 
@@ -330,15 +333,6 @@ impl HeadlessFrontend {
         }
 
         Ok(Self { ptr })
-    }
-
-    /// Set the size of the render target
-    #[allow(dead_code)] // Public API reserved for future dynamic resize support
-    pub fn set_size(&mut self, size: Size) {
-        // SAFETY: self.ptr is a valid non-null pointer created in HeadlessFrontend::new()
-        unsafe {
-            mln_headless_frontend_set_size(self.ptr, size.into());
-        }
     }
 
     /// Get the raw pointer (for internal use)
@@ -369,6 +363,11 @@ unsafe impl Send for NativeMap {}
 
 impl NativeMap {
     /// Create a new map instance
+    ///
+    /// # Errors
+    ///
+    /// [`TileServerError::RenderError`] when the native map cannot be
+    /// created.
     pub fn new(size: Size, pixel_ratio: f32, mode: MapMode) -> Result<Self> {
         let frontend = HeadlessFrontend::new(size, pixel_ratio)?;
 
@@ -387,44 +386,15 @@ impl NativeMap {
         })
     }
 
-    /// Create a new map instance with a custom resource loader callback
-    #[allow(dead_code)] // Public API for custom resource loading; not yet used by any route handler
-    pub fn with_resource_loader(
-        size: Size,
-        pixel_ratio: f32,
-        mode: MapMode,
-        callback: MLNResourceCallback,
-        user_data: *mut std::ffi::c_void,
-    ) -> Result<Self> {
-        let frontend = HeadlessFrontend::new(size, pixel_ratio)?;
-
-        // SAFETY: frontend.as_ptr() is a valid non-null pointer, callback and user_data are valid FFI parameters
-        let ptr = unsafe {
-            mln_map_create_with_loader(
-                frontend.as_ptr(),
-                pixel_ratio,
-                mode.into(),
-                callback,
-                user_data,
-            )
-        };
-
-        if ptr.is_null() {
-            return Err(TileServerError::RenderError(
-                get_last_error().unwrap_or_else(|| "Failed to create map with loader".to_string()),
-            ));
-        }
-
-        Ok(Self {
-            ptr,
-            _frontend: frontend,
-        })
-    }
-
     /// Load a style JSON
+    ///
+    /// # Errors
+    ///
+    /// [`TileServerError::RenderError`] when the style JSON contains a null
+    /// byte or MapLibre rejects it.
     pub fn load_style(&mut self, style_json: &str) -> Result<()> {
         let c_style = CString::new(style_json).map_err(|_| {
-            TileServerError::RenderError("Style JSON contains null bytes".to_string())
+            TileServerError::RenderError("style JSON contains null bytes".to_string())
         })?;
 
         // SAFETY: self.ptr is a valid non-null map pointer, c_style.as_ptr() is a valid C string
@@ -439,22 +409,6 @@ impl NativeMap {
         Ok(())
     }
 
-    /// Check if the map is fully loaded
-    #[allow(dead_code)] // Public API for polling map readiness; used in future async render path
-    pub fn is_fully_loaded(&self) -> bool {
-        // SAFETY: self.ptr is a valid non-null map pointer created in NativeMap::new()
-        unsafe { mln_map_is_fully_loaded(self.ptr) }
-    }
-
-    #[allow(dead_code)] // Public API for explicit camera control; render() accepts camera via RenderOptions
-    pub fn set_camera(&mut self, camera: CameraOptions) {
-        let c_camera: MLNCameraOptions = camera.into();
-        // SAFETY: self.ptr is a valid non-null map pointer, c_camera is a valid stack reference
-        unsafe {
-            mln_map_set_camera(self.ptr, &c_camera);
-        }
-    }
-
     pub fn set_size(&mut self, size: Size) {
         // SAFETY: self.ptr is a valid non-null map pointer created in NativeMap::new()
         unsafe {
@@ -463,6 +417,10 @@ impl NativeMap {
     }
 
     /// Render a still image synchronously
+    ///
+    /// # Errors
+    ///
+    /// [`TileServerError::RenderError`] when MapLibre Native fails to render.
     pub fn render(&mut self, options: Option<RenderOptions>) -> Result<RenderedImage> {
         let mut image_data = MLNImageData::default();
 
@@ -514,6 +472,10 @@ impl NativeMap {
     }
 
     /// Render a tile at the given coordinates
+    ///
+    /// # Errors
+    ///
+    /// [`TileServerError::RenderError`] when MapLibre Native fails to render.
     pub fn render_tile(
         &mut self,
         z: u8,

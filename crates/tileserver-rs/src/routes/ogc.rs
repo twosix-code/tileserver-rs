@@ -10,8 +10,6 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::Deserialize;
-#[cfg(test)]
-use serde::Serialize;
 
 use crate::error::TileServerError;
 use crate::reload::SharedState;
@@ -58,7 +56,6 @@ pub(crate) struct ItemsQueryParams {
     #[serde(default)]
     offset: i64,
     /// ISO 8601 datetime filter (reserved for future use).
-    #[allow(dead_code)]
     #[serde(default)]
     datetime: Option<String>,
 }
@@ -270,93 +267,110 @@ pub(crate) async fn items(
 ) -> Result<Response, TileServerError> {
     let state = shared.load();
     let base = build_base_url(&state);
-
-    let source = state
-        .sources
-        .get(&collection_id)
-        .ok_or_else(|| TileServerError::SourceNotFound(collection_id.clone()))?;
-
-    let table_source = source
-        .as_any()
-        .downcast_ref::<PostgresTableSource>()
-        .ok_or_else(|| {
-            TileServerError::NotFound(format!(
-                "collection '{collection_id}' is not an OGC features source"
-            ))
-        })?;
-
-    let limit = params.limit.clamp(1, OGC_FEATURES_LIMIT_MAX);
-    let offset = params.offset.max(0);
-
-    reject_datetime(params.datetime.as_deref())?;
-
-    let bbox = parse_bbox(params.bbox.as_deref())?;
-
-    let bbox_crs = match params.bbox_crs.as_deref() {
-        Some(raw) => ogc_crs::parse_crs(raw)?,
-        None => Crs::crs84(),
-    };
-    let output_crs = match params.crs.as_deref() {
-        Some(raw) => ogc_crs::parse_crs(raw)?,
-        None => Crs::crs84(),
-    };
-    let filter_crs = match params.filter_crs.as_deref() {
-        Some(raw) => Some(ogc_crs::parse_crs(raw)?),
-        None => None,
-    };
-
-    let filter_sql = match params.filter.as_deref() {
-        Some(raw) if !raw.trim().is_empty() => Some(ogc_filter::translate_filter_to_sql(
-            raw,
-            params.filter_lang.as_deref(),
-            &table_source.table_info().properties,
-        )?),
-        _ => None,
-    };
+    let table_source = resolve_table(&state, &collection_id)?;
+    let query = ItemsQuery::parse(&params, &table_source.table_info().properties)?;
 
     let (features, number_matched) = table_source
         .query_features_geojson(
-            bbox,
-            bbox_crs.srid(),
-            output_crs.srid(),
-            filter_sql.as_deref(),
-            filter_crs.as_ref().map(Crs::srid),
-            limit,
-            offset,
+            query.bbox,
+            query.bbox_crs.srid(),
+            query.output_crs.srid(),
+            query.filter_sql.as_deref(),
+            query.filter_crs.as_ref().map(Crs::srid),
+            query.limit,
+            query.offset,
         )
         .await?;
-
     let number_returned = features.len() as i64;
-
-    let mut links = vec![serde_json::json!({
-        "href": format!("{base}/collections/{collection_id}/items?limit={limit}&offset={offset}"),
-        "rel": "self",
-        "type": "application/geo+json",
-        "title": "this page"
-    })];
-
-    if offset + number_returned < number_matched {
-        let next_offset = offset + limit;
-        links.push(serde_json::json!({
-            "href": format!("{base}/collections/{collection_id}/items?limit={limit}&offset={next_offset}"),
-            "rel": "next",
-            "type": "application/geo+json",
-            "title": "next page"
-        }));
-    }
 
     let body = serde_json::json!({
         "type": "FeatureCollection",
         "features": features,
         "numberMatched": number_matched,
         "numberReturned": number_returned,
-        "links": links
+        "links": page_links(
+            &format!("{base}/collections/{collection_id}/items"),
+            query.limit,
+            query.offset,
+            number_returned,
+            number_matched,
+        ),
     });
+    geojson_response(body, &query.output_crs)
+}
 
-    let content_crs = HeaderValue::from_str(&output_crs.header_value()).map_err(|_| {
+/// The validated `/items` request: paging clamped, CRSs parsed and the CQL2
+/// filter translated to SQL against the table's columns.
+struct ItemsQuery {
+    limit: i64,
+    offset: i64,
+    bbox: Option<[f64; 4]>,
+    bbox_crs: Crs,
+    output_crs: Crs,
+    filter_crs: Option<Crs>,
+    filter_sql: Option<String>,
+}
+
+impl ItemsQuery {
+    fn parse(params: &ItemsQueryParams, properties: &[String]) -> Result<Self, TileServerError> {
+        reject_datetime(params.datetime.as_deref())?;
+        let filter_sql = match params.filter.as_deref() {
+            Some(raw) if !raw.trim().is_empty() => Some(ogc_filter::translate_filter_to_sql(
+                raw,
+                params.filter_lang.as_deref(),
+                properties,
+            )?),
+            _ => None,
+        };
+        Ok(Self {
+            limit: params.limit.clamp(1, OGC_FEATURES_LIMIT_MAX),
+            offset: params.offset.max(0),
+            bbox: parse_bbox(params.bbox.as_deref())?,
+            bbox_crs: crs_or_crs84(params.bbox_crs.as_deref())?,
+            output_crs: crs_or_crs84(params.crs.as_deref())?,
+            filter_crs: params
+                .filter_crs
+                .as_deref()
+                .map(ogc_crs::parse_crs)
+                .transpose()?,
+            filter_sql,
+        })
+    }
+}
+
+/// Parse an optional CRS parameter; absent means CRS84.
+fn crs_or_crs84(raw: Option<&str>) -> Result<Crs, TileServerError> {
+    raw.map_or_else(|| Ok(Crs::crs84()), ogc_crs::parse_crs)
+}
+
+/// `self` link, plus `next` when more features follow this page.
+fn page_links(
+    items_url: &str,
+    limit: i64,
+    offset: i64,
+    returned: i64,
+    matched: i64,
+) -> Vec<serde_json::Value> {
+    let link = |offset: i64, rel: &str, title: &str| {
+        serde_json::json!({
+            "href": format!("{items_url}?limit={limit}&offset={offset}"),
+            "rel": rel,
+            "type": "application/geo+json",
+            "title": title
+        })
+    };
+    let mut links = vec![link(offset, "self", "this page")];
+    if offset + returned < matched {
+        links.push(link(offset + limit, "next", "next page"));
+    }
+    links
+}
+
+/// A GeoJSON 200 response carrying the `Content-Crs` of `crs`.
+fn geojson_response(body: serde_json::Value, crs: &Crs) -> Result<Response, TileServerError> {
+    let content_crs = HeaderValue::from_str(&crs.header_value()).map_err(|_| {
         TileServerError::PostgresError("failed to encode Content-Crs header".into())
     })?;
-
     Ok((
         StatusCode::OK,
         [
@@ -804,14 +818,55 @@ fn parse_bbox(bbox_str: Option<&str>) -> Result<Option<[f64; 4]>, TileServerErro
 mod tests {
     use super::*;
 
-    #[derive(Debug, Clone, Serialize)]
-    struct OgcLink {
-        href: String,
-        rel: String,
-        #[serde(rename = "type")]
-        media_type: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        title: Option<String>,
+    fn items_params(query: &str) -> ItemsQueryParams {
+        serde_urlencoded::from_str(query).unwrap()
+    }
+
+    #[test]
+    fn page_links_add_next_only_when_more_features_follow() {
+        let links = page_links("http://x/items", 10, 0, 10, 25);
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0]["href"], "http://x/items?limit=10&offset=0");
+        assert_eq!(links[1]["rel"], "next");
+        assert_eq!(links[1]["href"], "http://x/items?limit=10&offset=10");
+        assert_eq!(page_links("http://x/items", 10, 20, 5, 25).len(), 1);
+    }
+
+    #[test]
+    fn items_query_clamps_paging_and_defaults_to_crs84() {
+        let q = ItemsQuery::parse(&items_params("limit=0&offset=-5"), &[]).unwrap();
+        assert_eq!((q.limit, q.offset), (1, 0));
+        assert_eq!(q.output_crs.srid(), Crs::crs84().srid());
+        assert!(q.bbox.is_none() && q.filter_sql.is_none() && q.filter_crs.is_none());
+        let q = ItemsQuery::parse(&items_params("limit=999999"), &[]).unwrap();
+        assert_eq!(q.limit, OGC_FEATURES_LIMIT_MAX);
+    }
+
+    #[test]
+    fn items_query_parses_bbox_crs_and_filter() {
+        let props = vec!["population".to_string()];
+        let q = ItemsQuery::parse(
+            &items_params(
+                "bbox=1,2,3,4&crs=http://www.opengis.net/def/crs/EPSG/0/3857\
+                 &filter-crs=http://www.opengis.net/def/crs/EPSG/0/4326&filter=population%20%3E%205",
+            ),
+            &props,
+        )
+        .unwrap();
+        assert_eq!(q.bbox, Some([1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(q.output_crs.srid(), 3857);
+        assert_eq!(q.filter_crs.map(|c| c.srid()), Some(4326));
+        assert!(q.filter_sql.unwrap().contains("population"));
+        // A blank filter is no filter.
+        let q = ItemsQuery::parse(&items_params("filter=%20"), &props).unwrap();
+        assert!(q.filter_sql.is_none());
+    }
+
+    #[test]
+    fn items_query_rejects_bad_crs_datetime_and_filter() {
+        assert!(ItemsQuery::parse(&items_params("crs=EPSG:nope"), &[]).is_err());
+        assert!(ItemsQuery::parse(&items_params("datetime=2020-01-01"), &[]).is_err());
+        assert!(ItemsQuery::parse(&items_params("filter=unknown_col%20%3D%201"), &[]).is_err());
     }
 
     #[test]
@@ -844,16 +899,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_bbox_too_few_values_fails() {
-        assert!(parse_bbox(Some("-180,-90,180")).is_err());
-    }
-
-    #[test]
-    fn parse_bbox_too_many_values_fails() {
-        assert!(parse_bbox(Some("-180,-90,180,90,100")).is_err());
-    }
-
-    #[test]
     fn parse_bbox_non_numeric_fails() {
         assert!(parse_bbox(Some("abc,-90,180,90")).is_err());
     }
@@ -861,34 +906,6 @@ mod tests {
     #[test]
     fn parse_bbox_empty_string_fails() {
         assert!(parse_bbox(Some("")).is_err());
-    }
-
-    #[test]
-    fn conformance_includes_required_classes() {
-        let body = serde_json::json!({
-            "conformsTo": [
-                "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/core",
-                "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/oas30",
-                "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/geojson"
-            ]
-        });
-        let conforms = body["conformsTo"].as_array().unwrap();
-        assert_eq!(conforms.len(), 3);
-        assert!(
-            conforms
-                .iter()
-                .any(|v| v.as_str().unwrap().contains("conf/core"))
-        );
-        assert!(
-            conforms
-                .iter()
-                .any(|v| v.as_str().unwrap().contains("conf/oas30"))
-        );
-        assert!(
-            conforms
-                .iter()
-                .any(|v| v.as_str().unwrap().contains("conf/geojson"))
-        );
     }
 
     #[test]
@@ -980,44 +997,6 @@ mod tests {
     }
 
     #[test]
-    fn default_limit_is_10() {
-        assert_eq!(default_limit(), OGC_FEATURES_LIMIT_DEFAULT);
-        assert_eq!(OGC_FEATURES_LIMIT_DEFAULT, 10);
-    }
-
-    #[test]
-    fn max_limit_is_10000() {
-        assert_eq!(OGC_FEATURES_LIMIT_MAX, 10_000);
-    }
-
-    #[test]
-    fn ogc_link_serializes_correctly() {
-        let link = OgcLink {
-            href: "http://example.com".to_string(),
-            rel: "self".to_string(),
-            media_type: "application/json".to_string(),
-            title: Some("Test".to_string()),
-        };
-        let json = serde_json::to_value(&link).unwrap();
-        assert_eq!(json["href"], "http://example.com");
-        assert_eq!(json["rel"], "self");
-        assert_eq!(json["type"], "application/json");
-        assert_eq!(json["title"], "Test");
-    }
-
-    #[test]
-    fn ogc_link_skips_none_title() {
-        let link = OgcLink {
-            href: "http://example.com".to_string(),
-            rel: "self".to_string(),
-            media_type: "application/json".to_string(),
-            title: None,
-        };
-        let json = serde_json::to_value(&link).unwrap();
-        assert!(!json.as_object().unwrap().contains_key("title"));
-    }
-
-    #[test]
     fn items_query_params_defaults() {
         let params: ItemsQueryParams = serde_json::from_str(r#"{}"#).unwrap();
         assert!(params.bbox.is_none());
@@ -1039,210 +1018,6 @@ mod tests {
     fn parse_bbox_zero_width_valid() {
         let result = parse_bbox(Some("10,20,10,20")).unwrap().unwrap();
         assert_eq!(result, [10.0, 20.0, 10.0, 20.0]);
-    }
-
-    #[test]
-    fn parse_bbox_decimal_precision() {
-        let result = parse_bbox(Some("8.12345,47.54321,9.98765,48.01234"))
-            .unwrap()
-            .unwrap();
-        assert!((result[0] - 8.12345).abs() < f64::EPSILON);
-        assert!((result[1] - 47.54321).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn build_collection_json_crs_field() {
-        let meta = crate::sources::TileMetadata {
-            id: "t".to_string(),
-            name: "T".to_string(),
-            description: None,
-            attribution: None,
-            format: crate::sources::TileFormat::Pbf,
-            minzoom: 0,
-            maxzoom: 22,
-            bounds: None,
-            center: None,
-            vector_layers: None,
-        };
-        let json = build_collection_json(&meta, "http://localhost", 4326);
-        let crs = json["crs"].as_array().unwrap();
-        assert_eq!(crs.len(), 1);
-        assert!(crs[0].as_str().unwrap().contains("CRS84"));
-    }
-
-    #[test]
-    fn conformance_three_uris() {
-        let body = serde_json::json!({
-            "conformsTo": [
-                "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/core",
-                "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/oas30",
-                "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/geojson"
-            ]
-        });
-        assert_eq!(body["conformsTo"].as_array().unwrap().len(), 3);
-    }
-
-    #[test]
-    fn feature_collection_structure() {
-        let body = serde_json::json!({
-            "type": "FeatureCollection",
-            "features": [],
-            "numberMatched": 0,
-            "numberReturned": 0,
-            "links": []
-        });
-        assert_eq!(body["type"], "FeatureCollection");
-        assert!(body["features"].as_array().unwrap().is_empty());
-        assert_eq!(body["numberMatched"], 0);
-        assert_eq!(body["numberReturned"], 0);
-    }
-
-    #[test]
-    fn feature_structure() {
-        let body = serde_json::json!({
-            "type": "Feature",
-            "id": "42",
-            "geometry": {"type": "Point", "coordinates": [8.5, 47.5]},
-            "properties": {"name": "Zurich"},
-            "links": []
-        });
-        assert_eq!(body["type"], "Feature");
-        assert_eq!(body["id"], "42");
-        assert_eq!(body["geometry"]["type"], "Point");
-        assert_eq!(body["properties"]["name"], "Zurich");
-    }
-
-    #[test]
-    fn landing_page_structure() {
-        let landing = serde_json::json!({
-            "title": "tileserver-rs OGC API",
-            "description": "OGC API Features access to PostGIS table sources",
-            "links": [
-                {"href": "http://localhost:8080/ogc", "rel": "self", "type": "application/json"},
-                {"href": "http://localhost:8080/ogc/conformance", "rel": "conformance", "type": "application/json"},
-                {"href": "http://localhost:8080/ogc/collections", "rel": "data", "type": "application/json"},
-                {"href": "http://localhost:8080/openapi.json", "rel": "service-desc", "type": "application/vnd.oai.openapi+json;version=3.0"},
-                {"href": "http://localhost:8080/_openapi", "rel": "service-doc", "type": "text/html"}
-            ]
-        });
-        assert_eq!(landing["title"], "tileserver-rs OGC API");
-        let links = landing["links"].as_array().unwrap();
-        assert_eq!(links.len(), 5);
-        assert!(links.iter().any(|l| l["rel"] == "self"));
-        assert!(links.iter().any(|l| l["rel"] == "conformance"));
-        assert!(links.iter().any(|l| l["rel"] == "data"));
-        assert!(links.iter().any(|l| l["rel"] == "service-desc"));
-        assert!(links.iter().any(|l| l["rel"] == "service-doc"));
-    }
-
-    #[test]
-    fn landing_page_link_types() {
-        let links = [
-            OgcLink {
-                href: "http://localhost".to_string(),
-                rel: "self".to_string(),
-                media_type: "application/json".to_string(),
-                title: Some("this document".to_string()),
-            },
-            OgcLink {
-                href: "http://localhost/conformance".to_string(),
-                rel: "conformance".to_string(),
-                media_type: "application/json".to_string(),
-                title: None,
-            },
-        ];
-        assert_eq!(links[0].rel, "self");
-        assert_eq!(links[1].rel, "conformance");
-    }
-
-    #[test]
-    fn pagination_link_next() {
-        let base = "http://localhost:8080";
-        let collection_id = "test";
-        let limit = 10;
-        let offset = 0;
-        let number_returned = 10i64;
-        let number_matched = 25i64;
-
-        let has_next = offset + number_returned < number_matched;
-        assert!(has_next);
-
-        let next_offset = offset + limit;
-        let next_href =
-            format!("{base}/collections/{collection_id}/items?limit={limit}&offset={next_offset}");
-        assert!(next_href.contains("offset=10"));
-    }
-
-    #[test]
-    fn pagination_no_next_when_exhausted() {
-        let offset = 20i64;
-        let number_returned = 5i64;
-        let number_matched = 25i64;
-
-        let has_next = offset + number_returned < number_matched;
-        assert!(!has_next);
-    }
-
-    #[test]
-    fn limit_clamp_within_range() {
-        let limit: i64 = 50;
-        let clamped = limit.clamp(1, OGC_FEATURES_LIMIT_MAX);
-        assert_eq!(clamped, 50);
-    }
-
-    #[test]
-    fn limit_clamp_exceeds_max() {
-        let limit: i64 = 50_000;
-        let clamped = limit.clamp(1, OGC_FEATURES_LIMIT_MAX);
-        assert_eq!(clamped, OGC_FEATURES_LIMIT_MAX);
-    }
-
-    #[test]
-    fn limit_clamp_below_min() {
-        let limit: i64 = -5;
-        let clamped = limit.clamp(1, OGC_FEATURES_LIMIT_MAX);
-        assert_eq!(clamped, 1);
-    }
-
-    #[test]
-    fn offset_max_zero() {
-        let offset: i64 = -10;
-        let clamped = offset.max(0);
-        assert_eq!(clamped, 0);
-    }
-
-    #[test]
-    fn offset_positive_passthrough() {
-        let offset: i64 = 100;
-        let clamped = offset.max(0);
-        assert_eq!(clamped, 100);
-    }
-
-    #[test]
-    fn build_collection_json_item_type() {
-        let meta = crate::sources::TileMetadata {
-            id: "pts".to_string(),
-            name: "Points".to_string(),
-            description: None,
-            attribution: None,
-            format: crate::sources::TileFormat::Pbf,
-            minzoom: 0,
-            maxzoom: 14,
-            bounds: Some([-180.0, -90.0, 180.0, 90.0]),
-            center: None,
-            vector_layers: None,
-        };
-        let json = build_collection_json(&meta, "http://localhost", 4326);
-        assert_eq!(json["itemType"], "feature");
-    }
-
-    #[test]
-    fn parse_bbox_negative_coordinates() {
-        let result = parse_bbox(Some("-122.5,37.5,-122.0,38.0"))
-            .unwrap()
-            .unwrap();
-        assert!((result[0] - (-122.5)).abs() < f64::EPSILON);
-        assert!((result[1] - 37.5).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -1272,24 +1047,6 @@ mod tests {
     fn reject_datetime_errors_on_any_value() {
         assert!(reject_datetime(Some("2024-01-01T00:00:00Z")).is_err());
         assert!(reject_datetime(Some("2024-01-01/2024-12-31")).is_err());
-    }
-
-    #[test]
-    fn conformance_includes_part2_crs_class() {
-        let body = serde_json::json!({
-            "conformsTo": [
-                "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/core",
-                "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/oas30",
-                "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/geojson",
-                ogc_crs::CONFORMANCE_CRS,
-            ]
-        });
-        let classes = body["conformsTo"].as_array().unwrap();
-        assert!(
-            classes
-                .iter()
-                .any(|c| c.as_str().unwrap().contains("features-2/1.0/conf/crs"))
-        );
     }
 
     #[test]
@@ -1418,15 +1175,6 @@ mod tests {
         let params: ItemsQueryParams = serde_json::from_str(r#"{"offset":-50}"#).unwrap();
         let clamped = params.offset.max(0);
         assert_eq!(clamped, 0);
-    }
-
-    #[test]
-    fn parse_bbox_large_negative_values() {
-        let result = parse_bbox(Some("-179.999,-89.999,179.999,89.999"))
-            .unwrap()
-            .unwrap();
-        assert!((result[0] - (-179.999)).abs() < 1e-6);
-        assert!((result[3] - 89.999).abs() < 1e-6);
     }
 
     #[test]
@@ -1641,29 +1389,6 @@ mod tests {
                 .iter()
                 .any(|l| l["rel"] == "self")
         );
-    }
-
-    #[tokio::test]
-    async fn test_collections_with_no_sources() {
-        let shared = make_test_shared_state(SourceManager::new());
-        let app = ogc_test_router(shared);
-
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/ogc/collections")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json["collections"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]

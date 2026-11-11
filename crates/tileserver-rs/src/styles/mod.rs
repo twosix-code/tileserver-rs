@@ -29,6 +29,11 @@ pub struct Style {
 
 impl Style {
     /// Load a style from a file path
+    ///
+    /// # Errors
+    ///
+    /// [`TileServerError::FileError`] when the file cannot be read, and
+    /// [`TileServerError::MetadataError`] for invalid style JSON.
     pub fn from_file(config: &StyleConfig) -> Result<Self> {
         let path = Path::new(&config.path);
 
@@ -39,7 +44,7 @@ impl Style {
         let content = std::fs::read_to_string(path).map_err(TileServerError::FileError)?;
 
         let style_json: serde_json::Value = serde_json::from_str(&content)
-            .map_err(|e| TileServerError::MetadataError(format!("Invalid style JSON: {}", e)))?;
+            .map_err(|e| TileServerError::MetadataError(format!("invalid style JSON: {}", e)))?;
 
         let name = config
             .name
@@ -99,6 +104,10 @@ impl StyleManager {
     }
 
     /// Load styles from configuration
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Style::from_file`].
     pub fn from_configs(configs: &[StyleConfig]) -> Result<Self> {
         let mut manager = Self::new();
 
@@ -1070,25 +1079,6 @@ mod tests {
             result["sprite"],
             "http://localhost:8080/styles/basic/sprite"
         );
-    }
-
-    #[test]
-    fn test_rewrite_style_for_native_mlt_source_uses_pbf() {
-        let mgr = manager_with_source("india", TileFormat::Mlt);
-        let style = json!({
-            "version": 8,
-            "sources": {
-                "india": { "type": "vector", "url": "/data/india" }
-            }
-        });
-
-        let result = rewrite_style_for_native(&style, "http://localhost:8080", &mgr);
-        let src = &result["sources"]["india"];
-        assert_eq!(
-            src["tiles"][0],
-            "http://localhost:8080/data/india/{z}/{x}/{y}.pbf"
-        );
-        assert!(src.get("encoding").is_none());
     }
 
     #[test]

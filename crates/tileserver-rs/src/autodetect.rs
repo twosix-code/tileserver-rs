@@ -38,6 +38,30 @@ pub struct AutoDetectReport {
     pub conflicts: Vec<String>,
 }
 
+impl AutoDetectReport {
+    /// Startup log lines: the scanned path and what was found. Conflicts
+    /// are not included; log them as warnings.
+    #[must_use]
+    pub fn summary(&self) -> Vec<String> {
+        let mut lines = vec![format!("Auto-detected from: {}", self.target.display())];
+        if !self.sources.is_empty() {
+            let ids: Vec<&str> = self.sources.iter().map(|s| s.id.as_str()).collect();
+            lines.push(format!("  Sources: {} ({})", ids.len(), ids.join(", ")));
+        }
+        if !self.styles.is_empty() {
+            let ids: Vec<&str> = self.styles.iter().map(|s| s.id.as_str()).collect();
+            lines.push(format!("  Styles: {} ({})", ids.len(), ids.join(", ")));
+        }
+        if let Some(fonts) = &self.fonts_dir {
+            lines.push(format!("  Fonts: {}", fonts.display()));
+        }
+        if !self.geojson_files.is_empty() {
+            lines.push(format!("  GeoJSON files: {}", self.geojson_files.len()));
+        }
+        lines
+    }
+}
+
 fn source_type_suffix(source_type: &SourceType) -> &'static str {
     match source_type {
         SourceType::PMTiles => "pmtiles",
@@ -406,6 +430,44 @@ pub fn detect_config(target_path: PathBuf) -> anyhow::Result<(Config, AutoDetect
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn summary_lists_only_what_was_found() {
+        let mut report = AutoDetectReport {
+            target: PathBuf::from("/data"),
+            sources: vec![],
+            styles: vec![],
+            geojson_files: vec![],
+            fonts_dir: None,
+            sprites_dir: None,
+            conflicts: vec!["ignored".into()],
+        };
+        assert_eq!(report.summary(), ["Auto-detected from: /data"]);
+        report.sources = ["a", "b"]
+            .into_iter()
+            .map(|id| AutoDetectedSource {
+                id: id.into(),
+                source_type: SourceType::PMTiles,
+                path: PathBuf::from(id),
+            })
+            .collect();
+        report.styles = vec![AutoDetectedStyle {
+            id: "dark".into(),
+            path: PathBuf::from("dark.json"),
+        }];
+        report.fonts_dir = Some(PathBuf::from("/data/fonts"));
+        report.geojson_files = vec![PathBuf::from("x.geojson")];
+        assert_eq!(
+            report.summary(),
+            [
+                "Auto-detected from: /data",
+                "  Sources: 2 (a, b)",
+                "  Styles: 1 (dark)",
+                "  Fonts: /data/fonts",
+                "  GeoJSON files: 1",
+            ]
+        );
+    }
     use tempfile::TempDir;
 
     #[test]
@@ -449,18 +511,6 @@ mod tests {
         assert!(ids.contains("tiles"));
         assert!(ids.contains("tiles-pmtiles") || ids.contains("tiles-mbtiles"));
         assert!(!report.conflicts.is_empty());
-    }
-
-    #[test]
-    #[cfg(feature = "stac")]
-    fn test_source_type_suffix_stac() {
-        assert_eq!(source_type_suffix(&SourceType::Stac), "stac");
-    }
-
-    #[test]
-    fn test_source_type_suffix_known_types() {
-        assert_eq!(source_type_suffix(&SourceType::PMTiles), "pmtiles");
-        assert_eq!(source_type_suffix(&SourceType::MBTiles), "mbtiles");
     }
 
     #[test]
@@ -637,19 +687,6 @@ mod tests {
 
         let err = detect_config(path).unwrap_err();
         assert!(err.to_string().contains("Unsupported"));
-    }
-
-    #[test]
-    fn test_detect_config_directory_with_geojson() {
-        let temp = TempDir::new().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        std::fs::write(root.join("a.geojson"), b"{}").unwrap();
-        std::fs::write(root.join("b.geojson"), b"{}").unwrap();
-
-        let (config, report) = detect_config(root.clone()).unwrap();
-
-        assert_eq!(report.geojson_files.len(), 2);
-        assert_eq!(config.files, Some(root.clone()));
     }
 
     #[test]

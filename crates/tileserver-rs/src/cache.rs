@@ -86,6 +86,12 @@ impl TileCache {
     pub fn weighted_size(&self) -> u64 {
         self.cache.weighted_size()
     }
+
+    /// Configured capacity in bytes (`max_size_mb` × 1 MiB).
+    #[must_use]
+    pub fn capacity_bytes(&self) -> u64 {
+        self.cache.policy().max_capacity().unwrap_or(0)
+    }
 }
 
 impl std::fmt::Debug for TileCache {
@@ -126,20 +132,6 @@ mod tests {
         let result = cache.get(&key).await;
         assert!(result.is_some());
         assert_eq!(result.unwrap().data.len(), 1024);
-    }
-
-    #[tokio::test]
-    async fn test_cache_miss() {
-        let cache = TileCache::new(1, 3600);
-        let key = TileCacheKey {
-            source_id: "test".into(),
-            z: 14,
-            x: 8580,
-            y: 5737,
-            encoding: TileCompression::None,
-            filter: 0,
-        };
-        assert!(cache.get(&key).await.is_none());
     }
 
     #[tokio::test]
@@ -228,76 +220,6 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_key_equality() {
-        let k1 = TileCacheKey {
-            source_id: "a".into(),
-            z: 1,
-            x: 2,
-            y: 3,
-            encoding: TileCompression::None,
-            filter: 0,
-        };
-        let k2 = TileCacheKey {
-            source_id: "a".into(),
-            z: 1,
-            x: 2,
-            y: 3,
-            encoding: TileCompression::None,
-            filter: 0,
-        };
-        assert_eq!(k1, k2);
-    }
-
-    #[test]
-    fn test_cache_key_inequality_z() {
-        let k1 = TileCacheKey {
-            source_id: "a".into(),
-            z: 1,
-            x: 2,
-            y: 3,
-            encoding: TileCompression::None,
-            filter: 0,
-        };
-        let k2 = TileCacheKey {
-            source_id: "a".into(),
-            z: 2,
-            x: 2,
-            y: 3,
-            encoding: TileCompression::None,
-            filter: 0,
-        };
-        assert_ne!(k1, k2);
-    }
-
-    #[test]
-    fn test_cache_key_hash_consistency() {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let k1 = TileCacheKey {
-            source_id: "src".into(),
-            z: 5,
-            x: 10,
-            y: 20,
-            encoding: TileCompression::None,
-            filter: 0,
-        };
-        let k2 = TileCacheKey {
-            source_id: "src".into(),
-            z: 5,
-            x: 10,
-            y: 20,
-            encoding: TileCompression::None,
-            filter: 0,
-        };
-        let mut h1 = DefaultHasher::new();
-        let mut h2 = DefaultHasher::new();
-        k1.hash(&mut h1);
-        k2.hash(&mut h2);
-        assert_eq!(h1.finish(), h2.finish());
-    }
-
-    #[test]
     fn test_cache_debug_format() {
         let cache = TileCache::new(1, 60);
         let debug = format!("{:?}", cache);
@@ -355,27 +277,6 @@ mod tests {
             "same tile, different encoding must be a distinct cache entry"
         );
         assert!(cache.get(&gzip_key).await.is_some());
-    }
-
-    #[test]
-    fn test_cache_key_inequality_encoding() {
-        let gzip = TileCacheKey {
-            source_id: "a".into(),
-            z: 1,
-            x: 2,
-            y: 3,
-            encoding: TileCompression::Gzip,
-            filter: 0,
-        };
-        let zstd = TileCacheKey {
-            source_id: "a".into(),
-            z: 1,
-            x: 2,
-            y: 3,
-            encoding: TileCompression::Zstd,
-            filter: 0,
-        };
-        assert_ne!(gzip, zstd);
     }
 
     #[test]

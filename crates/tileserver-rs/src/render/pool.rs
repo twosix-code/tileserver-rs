@@ -22,6 +22,8 @@ pub struct PoolConfig {
     pub tile_size: u32,
     pub pool_size: usize,
     pub render_timeout: Duration,
+    /// Requests that may wait for a free worker before `dispatch` rejects.
+    pub queue_size: usize,
 }
 
 impl Default for PoolConfig {
@@ -30,6 +32,7 @@ impl Default for PoolConfig {
             tile_size: 512,
             pool_size: 4,
             render_timeout: Duration::from_secs(30),
+            queue_size: 256,
         }
     }
 }
@@ -57,6 +60,15 @@ enum RenderOutput {
 struct RenderRequest {
     job: RenderJob,
     response: oneshot::Sender<RenderOutput>,
+    /// After this instant the caller has already given up waiting.
+    deadline: std::time::Instant,
+}
+
+impl RenderRequest {
+    /// The caller timed out or went away, so rendering would be wasted work.
+    fn abandoned(&self, now: std::time::Instant) -> bool {
+        self.response.is_closed() || now >= self.deadline
+    }
 }
 
 pub struct RendererPool {
@@ -67,12 +79,21 @@ pub struct RendererPool {
 }
 
 impl RendererPool {
+    /// Start `pool_size` renderer worker threads.
+    ///
+    /// # Errors
+    ///
+    /// [`TileServerError::RenderError`] when MapLibre Native fails to
+    /// initialise or a worker thread cannot be spawned.
     pub fn new(config: PoolConfig, max_scale: u8) -> Result<Self> {
         super::native::init()?;
 
         let pool_size = config.pool_size.max(1);
         let tile_size = config.tile_size;
-        let (sender, receiver) = crossbeam_channel::unbounded::<RenderRequest>();
+        // Bounded: under a request storm, excess requests get 503 instead of
+        // queueing without limit (each holds its style JSON in memory).
+        let (sender, receiver) =
+            crossbeam_channel::bounded::<RenderRequest>(config.queue_size.max(1));
         let mut handles = Vec::with_capacity(pool_size);
 
         for i in 0..pool_size {
@@ -84,6 +105,10 @@ impl RendererPool {
                     let mut maps = WorkerMaps::new(tile_size);
 
                     while let Ok(request) = rx.recv() {
+                        if request.abandoned(std::time::Instant::now()) {
+                            tracing::debug!(worker = i, "skipping abandoned render job");
+                            continue;
+                        }
                         let output = match request.job {
                             RenderJob::Tile {
                                 ref style_json,
@@ -129,6 +154,11 @@ impl RendererPool {
     }
 
     /// Render a raster tile via a worker thread
+    ///
+    /// # Errors
+    ///
+    /// [`TileServerError::RenderBusy`] when the render queue is full, and
+    /// [`TileServerError::RenderError`] when the render fails or times out.
     pub async fn render_tile(
         &self,
         style_json: &str,
@@ -151,49 +181,35 @@ impl RendererPool {
                 scale: scale as f32,
             },
             response: tx,
+            deadline: std::time::Instant::now() + self.config.render_timeout,
         })?;
 
-        let result = match tokio::time::timeout(self.config.render_timeout, rx).await {
-            Ok(Ok(RenderOutput::Tile(result))) => result,
-            Ok(Ok(_)) => Err(TileServerError::RenderError(
-                "unexpected render output type".to_string(),
-            )),
-            Ok(Err(_)) => Err(TileServerError::RenderError(
-                "renderer worker dropped response".to_string(),
-            )),
-            Err(_) => Err(TileServerError::RenderError(format!(
-                "render timed out after {}s",
-                self.config.render_timeout.as_secs()
-            ))),
-        };
-
-        let error_msg: Option<String> = match &result {
-            Ok(_) => None,
-            Err(e) => Some(e.to_string()),
-        };
-        let (outcome, error_ref) = if error_msg.is_some() {
-            (crate::metrics::RenderOutcome::Error, error_msg.as_deref())
-        } else {
-            (crate::metrics::RenderOutcome::Success, None)
-        };
-        crate::metrics::render_recorded(crate::metrics::RenderEvent {
-            style: "tile",
-            format: crate::sources::TileFormat::Png,
-            duration: render_start.elapsed(),
-            outcome,
-            error_reason: error_ref,
-        });
-
+        let result = wait_for(rx, self.config.render_timeout, "render")
+            .await
+            .and_then(|output| match output {
+                RenderOutput::Tile(result) => result,
+                RenderOutput::Static(_) => Err(unexpected_output()),
+            });
+        record_render("tile", render_start, &result);
         result
     }
 
     /// Render a static map image via a worker thread
+    ///
+    /// # Errors
+    ///
+    /// [`TileServerError::RenderBusy`] when the render queue is full, and
+    /// [`TileServerError::RenderError`] when the render fails or times out.
     pub async fn render_static(
         &self,
         style_json: &str,
         options: RenderOptions,
     ) -> Result<RenderedImage> {
         let render_start = std::time::Instant::now();
+        let mut options = options;
+        options.pixel_ratio = options
+            .pixel_ratio
+            .clamp(1.0, f32::from(self.max_scale.max(1)));
         let (tx, rx) = oneshot::channel();
 
         self.dispatch(RenderRequest {
@@ -202,39 +218,16 @@ impl RendererPool {
                 options,
             },
             response: tx,
+            deadline: std::time::Instant::now() + self.config.render_timeout,
         })?;
 
-        let result = match tokio::time::timeout(self.config.render_timeout, rx).await {
-            Ok(Ok(RenderOutput::Static(result))) => result,
-            Ok(Ok(_)) => Err(TileServerError::RenderError(
-                "unexpected render output type".to_string(),
-            )),
-            Ok(Err(_)) => Err(TileServerError::RenderError(
-                "renderer worker dropped response".to_string(),
-            )),
-            Err(_) => Err(TileServerError::RenderError(format!(
-                "static render timed out after {}s",
-                self.config.render_timeout.as_secs()
-            ))),
-        };
-
-        let error_msg: Option<String> = match &result {
-            Ok(_) => None,
-            Err(e) => Some(e.to_string()),
-        };
-        let (outcome, error_ref) = if error_msg.is_some() {
-            (crate::metrics::RenderOutcome::Error, error_msg.as_deref())
-        } else {
-            (crate::metrics::RenderOutcome::Success, None)
-        };
-        crate::metrics::render_recorded(crate::metrics::RenderEvent {
-            style: "static",
-            format: crate::sources::TileFormat::Png,
-            duration: render_start.elapsed(),
-            outcome,
-            error_reason: error_ref,
-        });
-
+        let result = wait_for(rx, self.config.render_timeout, "static render")
+            .await
+            .and_then(|output| match output {
+                RenderOutput::Static(result) => result,
+                RenderOutput::Tile(_) => Err(unexpected_output()),
+            });
+        record_render("static", render_start, &result);
         result
     }
 
@@ -250,11 +243,52 @@ impl RendererPool {
         self.sender
             .as_ref()
             .ok_or_else(|| TileServerError::RenderError("renderer pool is shut down".to_string()))?
-            .send(request)
-            .map_err(|_| {
-                TileServerError::RenderError("all renderer workers have stopped".to_string())
+            .try_send(request)
+            .map_err(|e| match e {
+                crossbeam_channel::TrySendError::Full(_) => TileServerError::RenderBusy,
+                crossbeam_channel::TrySendError::Disconnected(_) => {
+                    TileServerError::RenderError("all renderer workers have stopped".to_string())
+                }
             })
     }
+}
+
+/// Wait for a worker's answer, at most `timeout`.
+async fn wait_for(
+    rx: oneshot::Receiver<RenderOutput>,
+    timeout: std::time::Duration,
+    what: &str,
+) -> Result<RenderOutput> {
+    match tokio::time::timeout(timeout, rx).await {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(_)) => Err(TileServerError::RenderError(
+            "renderer worker dropped response".to_string(),
+        )),
+        Err(_) => Err(TileServerError::RenderError(format!(
+            "{what} timed out after {}s",
+            timeout.as_secs()
+        ))),
+    }
+}
+
+fn unexpected_output() -> TileServerError {
+    TileServerError::RenderError("unexpected render output type".to_string())
+}
+
+/// Record the render duration and outcome in the metrics.
+fn record_render<T>(style: &'static str, started: std::time::Instant, result: &Result<T>) {
+    let error = result.as_ref().err().map(ToString::to_string);
+    crate::metrics::render_recorded(crate::metrics::RenderEvent {
+        style,
+        format: crate::sources::TileFormat::Png,
+        duration: started.elapsed(),
+        outcome: if error.is_some() {
+            crate::metrics::RenderOutcome::Error
+        } else {
+            crate::metrics::RenderOutcome::Success
+        },
+        error_reason: error.as_deref(),
+    });
 }
 
 impl Drop for RendererPool {
@@ -295,7 +329,7 @@ impl WorkerMaps {
     }
 
     fn get_tile_map(&mut self, scale: f32) -> Result<&mut NativeMap> {
-        let key = (scale * 100.0) as u32;
+        let key = scale_key(scale);
         if !self.tile_maps.contains_key(&key) {
             let map = NativeMap::new(
                 Size::new(self.tile_size, self.tile_size),
@@ -331,21 +365,12 @@ impl WorkerMaps {
         style_json: &str,
         options: &RenderOptions,
     ) -> Result<RenderedImage> {
-        let ratio_key = (options.pixel_ratio * 100.0) as u32;
-        let needs_new = match &self.static_map {
-            Some((key, _)) => *key != ratio_key,
-            None => true,
+        let ratio_key = scale_key(options.pixel_ratio);
+        let map = match reuse_if_same(self.static_map.take(), ratio_key) {
+            Some(map) => map,
+            None => NativeMap::new(options.size, options.pixel_ratio, MapMode::Static)?,
         };
-
-        if needs_new {
-            let map = NativeMap::new(options.size, options.pixel_ratio, MapMode::Static)?;
-            self.static_map = Some((ratio_key, map));
-        }
-
-        let (_, map) = self
-            .static_map
-            .as_mut()
-            .expect("static_map was initialized above");
+        let (_, map) = self.static_map.insert((ratio_key, map));
         map.set_size(options.size);
         map.load_style(style_json)?;
         map.render(Some(RenderOptions {
@@ -357,9 +382,101 @@ impl WorkerMaps {
     }
 }
 
+/// The cached map when it was built for `key`; `None` means build a new one.
+fn reuse_if_same<T>(slot: Option<(u32, T)>, key: u32) -> Option<T> {
+    slot.and_then(|(k, map)| (k == key).then_some(map))
+}
+
+/// Map cache key for a pixel ratio: hundredths, so 1.5 and 1.50 share a map.
+fn scale_key(ratio: f32) -> u32 {
+    (ratio * 100.0) as u32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn request(deadline: std::time::Instant) -> (RenderRequest, oneshot::Receiver<RenderOutput>) {
+        let (tx, rx) = oneshot::channel();
+        let job = RenderJob::Tile {
+            style_json: String::new(),
+            z: 0,
+            x: 0,
+            y: 0,
+            tile_size: 256,
+            scale: 1.0,
+        };
+        (
+            RenderRequest {
+                job,
+                response: tx,
+                deadline,
+            },
+            rx,
+        )
+    }
+
+    #[test]
+    fn abandoned_jobs_are_detected() {
+        let now = std::time::Instant::now();
+        let later = now + Duration::from_secs(5);
+        let (live, _rx) = request(later);
+        assert!(!live.abandoned(now), "caller waiting, deadline ahead");
+        assert!(live.abandoned(later), "deadline passed");
+        let (gone, rx) = request(later);
+        drop(rx);
+        assert!(gone.abandoned(now), "caller dropped its receiver");
+    }
+
+    #[test]
+    fn reuse_if_same_keeps_only_a_matching_map() {
+        assert_eq!(reuse_if_same(Some((100, "map")), 100), Some("map"));
+        assert_eq!(reuse_if_same(Some((100, "map")), 200), None);
+        assert_eq!(reuse_if_same::<&str>(None, 100), None);
+    }
+
+    #[test]
+    fn scale_key_groups_ratios_by_hundredths() {
+        assert_eq!(scale_key(1.0), 100);
+        assert_eq!(scale_key(2.5), 250);
+        assert_eq!(scale_key(1.5), scale_key(1.50));
+        assert_ne!(scale_key(1.0), scale_key(2.0));
+    }
+
+    #[tokio::test]
+    async fn wait_for_returns_the_answer_or_names_the_failure() {
+        let (tx, rx) = oneshot::channel();
+        tx.send(RenderOutput::Tile(Ok(vec![1]))).ok();
+        let out = wait_for(rx, std::time::Duration::from_secs(1), "render").await;
+        assert!(matches!(out, Ok(RenderOutput::Tile(Ok(ref b))) if b == &[1]));
+
+        let (tx, rx) = oneshot::channel::<RenderOutput>();
+        drop(tx);
+        let dropped = wait_for(rx, std::time::Duration::from_secs(1), "render").await;
+        assert!(
+            dropped
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("dropped response")
+        );
+
+        let (_tx, rx) = oneshot::channel::<RenderOutput>();
+        let late = wait_for(rx, std::time::Duration::from_millis(10), "static render").await;
+        assert!(
+            late.err()
+                .unwrap()
+                .to_string()
+                .contains("static render timed out")
+        );
+    }
+
+    #[test]
+    fn record_render_accepts_success_and_error() {
+        let started = std::time::Instant::now();
+        record_render("tile", started, &Ok::<_, TileServerError>(()));
+        record_render::<()>("static", started, &Err(unexpected_output()));
+    }
 
     #[tokio::test]
     async fn test_pool_creation() {

@@ -1,7 +1,7 @@
 //! Local file PMTiles source using memory-mapped I/O.
 
 use async_trait::async_trait;
-use pmtiles::{AsyncPmTilesReader, Compression as PmCompression, MmapBackend, TileCoord, TileType};
+use pmtiles::{AsyncPmTilesReader, Compression as PmCompression, FileBackend, TileCoord, TileType};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -10,8 +10,8 @@ use crate::config::SourceConfig;
 use crate::error::{Result, TileServerError};
 use crate::sources::{TileCompression, TileData, TileFormat, TileMetadata, TileSource};
 
-/// Type alias for local PMTiles reader: Backend=MmapBackend
-type LocalReader = AsyncPmTilesReader<MmapBackend>;
+/// Type alias for local PMTiles reader: Backend=FileBackend
+type LocalReader = AsyncPmTilesReader<FileBackend>;
 
 /// Local file-based PMTiles tile source using memory-mapped I/O
 pub struct LocalPmTilesSource {
@@ -28,6 +28,11 @@ pub struct LocalPmTilesSource {
 
 impl LocalPmTilesSource {
     /// Create a new PMTiles source from a local file path
+    ///
+    /// # Errors
+    ///
+    /// [`TileServerError::ConfigError`] when the file is missing, and
+    /// [`TileServerError::MetadataError`] when it cannot be opened or read.
     pub async fn from_file(config: &SourceConfig) -> Result<Self> {
         let path = &config.path;
 
@@ -42,8 +47,8 @@ impl LocalPmTilesSource {
         }
 
         // Create memory-mapped backend
-        let backend = MmapBackend::try_from(Path::new(path)).await.map_err(|e| {
-            TileServerError::MetadataError(format!("Failed to open PMTiles file: {}", e))
+        let backend = FileBackend::try_from(Path::new(path)).await.map_err(|e| {
+            TileServerError::MetadataError(format!("failed to open PMTiles file: {}", e))
         })?;
 
         // Create async reader
@@ -51,7 +56,7 @@ impl LocalPmTilesSource {
             AsyncPmTilesReader::try_from_source(backend)
                 .await
                 .map_err(|e| {
-                    TileServerError::MetadataError(format!("Failed to read PMTiles header: {}", e))
+                    TileServerError::MetadataError(format!("failed to read PMTiles header: {}", e))
                 })?;
 
         let header = reader.get_header();

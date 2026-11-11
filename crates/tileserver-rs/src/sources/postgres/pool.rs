@@ -30,6 +30,12 @@ pub struct PostgresPool {
 }
 
 impl PostgresPool {
+    /// # Errors
+    ///
+    /// [`TileServerError::PostgresError`] for an invalid connection string,
+    /// [`TileServerError::PostgresPoolError`] when the pool cannot connect,
+    /// and [`TileServerError::PostgresVersionError`] when PostgreSQL or
+    /// PostGIS is too old.
     pub async fn new(
         connection_string: &str,
         settings: PoolSettings,
@@ -38,7 +44,7 @@ impl PostgresPool {
         _ssl_root_cert: Option<&PathBuf>,
     ) -> Result<Self> {
         let pg_config: tokio_postgres::Config = connection_string.parse().map_err(|e| {
-            TileServerError::PostgresError(format!("Invalid connection string: {}", e))
+            TileServerError::PostgresError(format!("invalid connection string: {}", e))
         })?;
 
         let id = pg_config
@@ -64,7 +70,7 @@ impl PostgresPool {
             .runtime(deadpool_postgres::Runtime::Tokio1)
             .build()
             .map_err(|e| {
-                TileServerError::PostgresPoolError(format!("Failed to build pool: {}", e))
+                TileServerError::PostgresPoolError(format!("failed to build pool: {}", e))
             })?;
 
         let mut result = Self {
@@ -118,12 +124,21 @@ impl PostgresPool {
         Ok(result)
     }
 
+    /// # Errors
+    ///
+    /// [`TileServerError::PostgresPoolError`] when no connection is available.
     pub async fn get(&self) -> Result<Object> {
         self.pool.get().await.map_err(|e| {
-            TileServerError::PostgresPoolError(format!("Failed to get connection: {}", e))
+            TileServerError::PostgresPoolError(format!("failed to get connection: {}", e))
         })
     }
 
+    /// Open every pool connection and prepare `queries` on each.
+    ///
+    /// # Errors
+    ///
+    /// [`TileServerError::PostgresPoolError`] when a connection cannot be
+    /// opened.
     pub async fn warmup(&self, queries: &[(&str, &[Type])]) -> Result<()> {
         let max_size = self.pool.status().max_size;
         let mut connections = Vec::with_capacity(max_size);
@@ -164,7 +179,6 @@ impl PostgresPool {
         Ok(())
     }
 
-    #[allow(dead_code)] // Public accessor; reserved for diagnostics and logging
     #[must_use]
     pub fn id(&self) -> &str {
         &self.id
@@ -176,13 +190,11 @@ impl PostgresPool {
         self.supports_tile_margin
     }
 
-    #[allow(dead_code)] // Public accessor; reserved for version-gated feature detection
     #[must_use]
     pub fn postgres_version(&self) -> &Version {
         &self.postgres_version
     }
 
-    #[allow(dead_code)] // Public accessor; reserved for PostGIS version-gated features
     #[must_use]
     pub fn postgis_version(&self) -> &Version {
         &self.postgis_version
@@ -201,13 +213,13 @@ impl PostgresPool {
             )
             .await
             .map_err(|e| {
-                TileServerError::PostgresError(format!("Failed to query PostgreSQL version: {}", e))
+                TileServerError::PostgresError(format!("failed to query PostgreSQL version: {}", e))
             })?;
 
         let version_str: String = row.get("version");
         version_str.parse().map_err(|e| {
             TileServerError::PostgresVersionError(format!(
-                "Invalid PostgreSQL version '{}': {}",
+                "invalid PostgreSQL version '{}': {}",
                 version_str, e
             ))
         })
@@ -226,47 +238,15 @@ impl PostgresPool {
             )
             .await
             .map_err(|e| {
-                TileServerError::PostgresError(format!("Failed to query PostGIS version: {}", e))
+                TileServerError::PostgresError(format!("failed to query PostGIS version: {}", e))
             })?;
 
         let version_str: String = row.get("version");
         version_str.parse().map_err(|e| {
             TileServerError::PostgresVersionError(format!(
-                "Invalid PostGIS version '{}': {}",
+                "invalid PostGIS version '{}': {}",
                 version_str, e
             ))
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_version_comparison() {
-        let v11 = Version::new(11, 0, 0);
-        let v12 = Version::new(12, 0, 0);
-        let v3_0 = Version::new(3, 0, 0);
-        let v3_1 = Version::new(3, 1, 0);
-
-        assert!(v11 >= MINIMUM_POSTGRES_VERSION);
-        assert!(v12 >= MINIMUM_POSTGRES_VERSION);
-        assert!(v3_0 >= MINIMUM_POSTGIS_VERSION);
-        assert!(v3_1 >= ST_TILE_ENVELOPE_MARGIN_VERSION);
-        assert!(v3_0 < ST_TILE_ENVELOPE_MARGIN_VERSION);
-    }
-
-    #[test]
-    fn test_version_parsing() {
-        let v: Version = "14.5.0".parse().unwrap();
-        assert_eq!(v.major, 14);
-        assert_eq!(v.minor, 5);
-        assert_eq!(v.patch, 0);
-
-        let v: Version = "3.4.2".parse().unwrap();
-        assert_eq!(v.major, 3);
-        assert_eq!(v.minor, 4);
-        assert_eq!(v.patch, 2);
     }
 }

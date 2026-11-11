@@ -5,12 +5,13 @@
 //! A single OpenTelemetry [`Meter`](opentelemetry::metrics::Meter) feeds both
 //! the existing OTLP push pipeline (in `crate::telemetry`) and a new
 //! Prometheus pull endpoint hosted on a separate listener. Application code
-//! calls typed facade functions on [`recorder`] and never imports
+//! calls typed facade functions on `recorder` and never imports
 //! `opentelemetry::*` directly.
 //!
 //! See `docs/superpowers/specs/2026-05-04-prometheus-metrics-design.md`
 //! for the full design rationale.
 
+pub mod dashboard;
 mod http_middleware;
 mod instruments;
 mod labels;

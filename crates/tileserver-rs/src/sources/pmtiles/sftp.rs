@@ -494,14 +494,20 @@ fn check_host_key(
     received_key: &[u8],
     strict: bool,
 ) -> HostKeyCheckOutcome {
-    if let Some(entry) = entries.iter().find(|e| host_matches(e, host, port)) {
-        return if entry.public_key == received_key {
-            HostKeyCheckOutcome::Match
-        } else {
-            HostKeyCheckOutcome::Mismatch {
-                expected: entry.public_key.clone(),
-                got: received_key.to_vec(),
-            }
+    // A host can have one known_hosts line per key type (ed25519, rsa, …).
+    // The server presents one key; accept it when any line for the host
+    // holds that key, as OpenSSH does.
+    let mut first_known: Option<&[u8]> = None;
+    for entry in entries.iter().filter(|e| host_matches(e, host, port)) {
+        if entry.public_key == received_key {
+            return HostKeyCheckOutcome::Match;
+        }
+        first_known.get_or_insert(&entry.public_key);
+    }
+    if let Some(expected) = first_known {
+        return HostKeyCheckOutcome::Mismatch {
+            expected: expected.to_vec(),
+            got: received_key.to_vec(),
         };
     }
     if strict {
@@ -675,10 +681,13 @@ impl SftpBackend {
     async fn establish(&self) -> Result<SftpConnection> {
         self.connect_attempts.fetch_add(1, Ordering::SeqCst);
 
-        let entries = load_known_hosts_entries(resolved_known_hosts_path(
-            &self.loc,
-            self.home_dir.as_deref(),
-        ));
+        // known_hosts is a file read: keep it off the runtime on each reconnect.
+        let known_hosts = resolved_known_hosts_path(&self.loc, self.home_dir.as_deref());
+        let entries = tokio::task::spawn_blocking(move || load_known_hosts_entries(known_hosts))
+            .await
+            .map_err(|e| {
+                TileServerError::SftpConnectionError(format!("known_hosts read task failed: {e}"))
+            })?;
 
         let verification_error = Arc::new(Mutex::new(None));
         let handler = SftpHandler {
@@ -821,7 +830,7 @@ impl SftpBackend {
         *self.next_backoff.lock().await = INITIAL_BACKOFF;
     }
 
-    async fn read_once(&self, offset: usize, length: usize) -> Result<Bytes> {
+    async fn read_once(&self, offset: u64, length: usize) -> Result<Bytes> {
         let mut file = self.open_remote_file().await?;
         seek_to(&mut file, offset).await?;
         read_range_into_buf(&mut file, length).await
@@ -848,11 +857,11 @@ impl SftpBackend {
 
 /// Seek `file` to `offset` from the start, mapping any IO failure to a
 /// connection error so the reconnect path can retry.
-async fn seek_to<S>(file: &mut S, offset: usize) -> Result<()>
+async fn seek_to<S>(file: &mut S, offset: u64) -> Result<()>
 where
     S: AsyncSeekExt + Unpin,
 {
-    file.seek(std::io::SeekFrom::Start(offset as u64))
+    file.seek(std::io::SeekFrom::Start(offset))
         .await
         .map(|_| ())
         .map_err(|e| TileServerError::SftpConnectionError(format!("seek to {offset} failed: {e}")))
@@ -882,7 +891,7 @@ where
 
 impl AsyncBackend for SftpBackend {
     #[instrument(skip(self), fields(host = %self.loc.host, path = %self.loc.path))]
-    async fn read(&self, offset: usize, length: usize) -> PmtResult<BackendResponse> {
+    async fn read(&self, offset: u64, length: usize) -> PmtResult<BackendResponse> {
         loop {
             match self.read_once(offset, length).await {
                 Ok(bytes) => {
@@ -1032,14 +1041,24 @@ async fn build_backend(config: &SourceConfig) -> Result<SftpBackend> {
         home_dir: home_dir.clone(),
         ssh_auth_sock: std::env::var("SSH_AUTH_SOCK").ok(),
     };
-    let identity = resolve_identity(&auth_opts)?;
+    // Identity resolution opens and stats key files: keep it off the runtime.
+    let identity = tokio::task::spawn_blocking(move || resolve_identity(&auth_opts))
+        .await
+        .map_err(|e| {
+            TileServerError::SftpAuthError(format!("identity lookup task failed: {e}"))
+        })??;
 
     SftpBackend::connect(loc, identity, home_dir).await
 }
 
-async fn open_reader(backend: SftpBackend, url_str: &str) -> Result<SftpReader> {
+/// Read the PMTiles header through `backend` and map failures to
+/// [`TileServerError::MetadataError`] naming the source URL.
+async fn open_reader<B: pmtiles::AsyncBackend + Sync + Send>(
+    backend: B,
+    url_str: &str,
+) -> Result<AsyncPmTilesReader<B, HashMapCache>> {
     let cache = HashMapCache::default();
-    AsyncPmTilesReader::try_from_cached_source(backend, cache)
+    AsyncPmTilesReader::try_from_source_and_cache(backend, cache)
         .await
         .map_err(|e| {
             TileServerError::MetadataError(format!(
@@ -1051,6 +1070,12 @@ async fn open_reader(backend: SftpBackend, url_str: &str) -> Result<SftpReader> 
 impl SftpPmTilesSource {
     /// Open a PMTiles archive over SFTP, resolving auth + host-key policy
     /// eagerly so failures surface at source-load time.
+    ///
+    /// # Errors
+    ///
+    /// SFTP errors for an invalid URL, a missing identity, a host-key
+    /// mismatch or a failed connection, and
+    /// [`TileServerError::MetadataError`] when the header cannot be read.
     pub async fn from_url(config: &SourceConfig) -> Result<Self> {
         let url_str = &config.path;
         info!("Opening SFTP PMTiles source: {url_str}");
@@ -1205,6 +1230,50 @@ impl TileSource for SftpPmTilesSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// In-memory [`pmtiles::AsyncBackend`] over a byte buffer, so
+    /// `open_reader` can be tested without an SSH server.
+    struct BytesBackend(bytes::Bytes);
+
+    impl pmtiles::AsyncBackend for BytesBackend {
+        async fn read(
+            &self,
+            offset: u64,
+            length: usize,
+        ) -> pmtiles::PmtResult<pmtiles::BackendResponse> {
+            let start = usize::try_from(offset)
+                .unwrap_or(usize::MAX)
+                .min(self.0.len());
+            let end = start.saturating_add(length).min(self.0.len());
+            Ok(pmtiles::BackendResponse::new(self.0.slice(start..end)))
+        }
+    }
+
+    #[tokio::test]
+    async fn open_reader_reads_the_header_of_a_valid_archive() {
+        let path = format!(
+            "{}/../../data/tiles/protomaps-sample.pmtiles",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let data = bytes::Bytes::from(std::fs::read(path).unwrap());
+        let reader = open_reader(BytesBackend(data), "sftp://host/a.pmtiles")
+            .await
+            .unwrap();
+        assert_eq!(reader.get_header().tile_type, TileType::Mvt);
+    }
+
+    #[tokio::test]
+    async fn open_reader_names_the_url_when_the_header_is_invalid() {
+        let junk = bytes::Bytes::from_static(b"not a pmtiles archive at all, just bytes");
+        let err = open_reader(BytesBackend(junk), "sftp://host/bad.pmtiles")
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            matches!(&err, TileServerError::MetadataError(m) if m.contains("sftp://host/bad.pmtiles")),
+            "{err:?}"
+        );
+    }
 
     fn opts(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs
@@ -1595,6 +1664,25 @@ mod tests {
     }
 
     #[test]
+    fn test_host_key_check_matches_any_key_type_for_host() {
+        let entries = vec![
+            entry_for("example.com", b"ED25519KEY"),
+            entry_for("example.com", b"RSAKEY"),
+        ];
+        assert_eq!(
+            check_host_key(&entries, "example.com", 22, b"RSAKEY", true),
+            HostKeyCheckOutcome::Match
+        );
+        assert_eq!(
+            check_host_key(&entries, "example.com", 22, b"OTHER", true),
+            HostKeyCheckOutcome::Mismatch {
+                expected: b"ED25519KEY".to_vec(),
+                got: b"OTHER".to_vec(),
+            }
+        );
+    }
+
+    #[test]
     fn test_host_key_check_unknown_strict() {
         let entries = vec![entry_for("other.com", b"KEY")];
         assert_eq!(
@@ -1747,6 +1835,58 @@ mod tests {
         backend.reset_backoff().await;
         let third = backend.next_backoff_delay().await;
         assert_eq!(third, INITIAL_BACKOFF);
+    }
+
+    /// `AsyncBackend::read` against a real SSH server whose host key is not
+    /// in known_hosts: the host-key error is not a connection error, so
+    /// `read` returns it at once instead of retrying.
+    #[tokio::test]
+    async fn read_returns_host_key_error_without_retry() {
+        struct AcceptAll;
+        impl russh::server::Handler for AcceptAll {
+            type Error = russh::Error;
+        }
+
+        let key_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/sftp/fixtures/ssh_host_ed25519_key"
+        );
+        let config = Arc::new(russh::server::Config {
+            keys: vec![load_secret_key(key_path, None).unwrap()],
+            ..Default::default()
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let config = Arc::clone(&config);
+                tokio::spawn(async move {
+                    if let Ok(session) = russh::server::run_stream(config, stream, AcceptAll).await
+                    {
+                        let _ = session.await;
+                    }
+                });
+            }
+        });
+
+        let backend = SftpBackend {
+            loc: SftpLocation::parse(
+                &format!("sftp://u@127.0.0.1:{port}/tiles.pmtiles"),
+                &HashMap::new(),
+            )
+            .unwrap(),
+            identity: ResolvedIdentity::Agent("unused".to_string()),
+            home_dir: None,
+            session: Mutex::new(None),
+            connect_attempts: AtomicU64::new(0),
+            next_backoff: Mutex::new(INITIAL_BACKOFF),
+        };
+        let err = tokio::time::timeout(Duration::from_secs(10), backend.read(1 << 33, 16))
+            .await
+            .expect("no reconnect loop")
+            .expect_err("unknown host key must fail");
+        assert!(err.to_string().contains("no known_hosts entry"), "{err}");
+        assert_eq!(backend.connect_attempts.load(Ordering::SeqCst), 1);
     }
 
     // Base64 encoder used only by the hashed-known_hosts test above.
@@ -2074,15 +2214,6 @@ mod tests {
         let mut rest = Vec::new();
         cursor.read_to_end(&mut rest).await.unwrap();
         assert_eq!(rest, b"456789");
-    }
-
-    #[tokio::test]
-    async fn test_seek_to_zero_is_start() {
-        let mut cursor = std::io::Cursor::new(b"abc".to_vec());
-        seek_to(&mut cursor, 0).await.unwrap();
-        let mut rest = Vec::new();
-        cursor.read_to_end(&mut rest).await.unwrap();
-        assert_eq!(rest, b"abc");
     }
 
     // ── U63–U66: read_range_into_buf (full read / EOF short read / empty) ──

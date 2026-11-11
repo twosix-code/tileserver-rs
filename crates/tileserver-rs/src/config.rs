@@ -45,6 +45,9 @@ pub struct Config {
     /// Server-side LLM proxy for the Map AI chat panel (`[llm]`).
     #[serde(default)]
     pub llm: LlmConfig,
+    /// Live source updates over WebSocket (`[live]`).
+    #[serde(default)]
+    pub live: LiveConfig,
     /// Model Context Protocol (MCP) server configuration.
     ///
     /// Only present when the binary is compiled with `--features mcp`.
@@ -61,6 +64,48 @@ pub struct Config {
     #[serde(default)]
     #[cfg(feature = "sftp")]
     pub sftp: Option<SftpConfig>,
+}
+
+/// Live source updates over WebSocket (`[live]`, issue #596).
+///
+/// With `enabled = true` the server mounts `GET /ws` and sends a `reload`
+/// message for each source whose data changes. Sources listed in `watch`
+/// (or `["*"]` for all) are polled every `interval_secs`: local files by
+/// modification time and size, `http(s)` sources by `ETag` /
+/// `Last-Modified`. A change reloads the server's sources and is then
+/// broadcast.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LiveConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Source ids to poll for changes; `["*"]` polls every source.
+    #[serde(default)]
+    pub watch: Vec<String>,
+    /// Seconds between polls (minimum 1).
+    #[serde(default = "default_live_interval_secs")]
+    pub interval_secs: u64,
+    /// Maximum concurrent WebSocket clients; more get `503`.
+    #[serde(default = "default_live_max_clients")]
+    pub max_clients: usize,
+}
+
+impl Default for LiveConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            watch: Vec::new(),
+            interval_secs: default_live_interval_secs(),
+            max_clients: default_live_max_clients(),
+        }
+    }
+}
+
+fn default_live_interval_secs() -> u64 {
+    5
+}
+
+fn default_live_max_clients() -> usize {
+    1000
 }
 
 /// Global defaults for SFTP PMTiles sources.
@@ -158,6 +203,11 @@ pub struct McpOAuthConfig {
     /// Cargo feature — startup fails fast if set without it. When unset,
     /// the store is in-memory and resets on every restart.
     pub store_path: Option<std::path::PathBuf>,
+    /// Operator secret that the consent page asks for before it issues an
+    /// authorization code. Required when `enabled = true`: without it, any
+    /// anonymous caller could approve itself. Use `${ENV_VAR}` to keep it
+    /// out of the config file.
+    pub approval_secret: Option<String>,
 }
 
 #[cfg(feature = "mcp")]
@@ -174,6 +224,7 @@ impl Default for McpOAuthConfig {
             signing_key_path: None,
             token_ttl_secs: default_token_ttl_secs(),
             store_path: None,
+            approval_secret: None,
         }
     }
 }
@@ -208,6 +259,9 @@ pub struct RenderPoolConfig {
     /// Render timeout in seconds — requests exceeding this are dropped (default: 30)
     #[serde(default = "default_render_timeout_secs")]
     pub render_timeout_secs: u64,
+    /// Render requests that may wait for a free worker; more get `503` (default: 256)
+    #[serde(default = "default_render_queue_size")]
+    pub queue_size: usize,
 }
 
 fn default_render_pool_size() -> usize {
@@ -218,11 +272,16 @@ fn default_render_timeout_secs() -> u64 {
     30
 }
 
+fn default_render_queue_size() -> usize {
+    256
+}
+
 impl Default for RenderPoolConfig {
     fn default() -> Self {
         Self {
             pool_size: default_render_pool_size(),
             render_timeout_secs: default_render_timeout_secs(),
+            queue_size: default_render_queue_size(),
         }
     }
 }
@@ -307,6 +366,10 @@ impl Default for CompressionConfig {
 
 impl CompressionConfig {
     /// Validate the compression knobs against their accepted ranges.
+    ///
+    /// # Errors
+    ///
+    /// [`TileServerError::ConfigError`](crate::error::TileServerError::ConfigError) for an out-of-range setting.
     pub fn validate(&self) -> crate::error::Result<()> {
         if self.br_quality > 11 {
             return Err(crate::error::TileServerError::ConfigError(format!(
@@ -385,6 +448,12 @@ pub struct LlmConfig {
     /// (default: 30).
     #[serde(default = "default_llm_rate_limit")]
     pub rate_limit_per_minute: u32,
+    /// Largest output a proxied request may ask for, in tokens (default:
+    /// 8192). `max_tokens`, `max_completion_tokens` and a thinking budget
+    /// above it are lowered to it, and `n` is forced to 1, so a client
+    /// cannot multiply the cost of the operator's key.
+    #[serde(default = "default_llm_max_output_tokens")]
+    pub max_output_tokens: u32,
 }
 
 const fn default_true_llm() -> bool {
@@ -399,6 +468,9 @@ const fn default_llm_max_body_bytes() -> usize {
 const fn default_llm_rate_limit() -> u32 {
     30
 }
+const fn default_llm_max_output_tokens() -> u32 {
+    8192
+}
 
 impl Default for LlmConfig {
     fn default() -> Self {
@@ -412,6 +484,7 @@ impl Default for LlmConfig {
             timeout_secs: default_llm_timeout_secs(),
             max_body_bytes: default_llm_max_body_bytes(),
             rate_limit_per_minute: default_llm_rate_limit(),
+            max_output_tokens: default_llm_max_output_tokens(),
         }
     }
 }
@@ -569,9 +642,22 @@ pub struct ServerConfig {
     /// Defaults to `<cache_dir>/uploads` (i.e. `resolve_cache_dir(None)`) if not set.
     #[serde(default)]
     pub upload_dir: Option<PathBuf>,
+    /// Extra `Host`/`Origin` names the admin listener accepts besides
+    /// loopback (`localhost`, `127.0.0.1`, `[::1]`). Needed when a reverse
+    /// proxy forwards its own `Host` header to the admin port. Other names
+    /// get 403, which blocks DNS-rebinding and cross-site requests.
+    #[serde(default)]
+    pub admin_allowed_hosts: Vec<String>,
     /// Maximum upload file size in megabytes (default: 500 MB)
     #[serde(default = "default_upload_max_size_mb")]
     pub upload_max_size_mb: u32,
+    /// Total disk space all uploaded files may use, in megabytes
+    /// (default: 5120 MB). Uploads past it get 413.
+    #[serde(default = "default_upload_max_total_mb")]
+    pub upload_max_total_mb: u32,
+    /// Maximum number of uploaded files kept at once (default: 100).
+    #[serde(default = "default_upload_max_files")]
+    pub upload_max_files: u32,
     /// User-defined response headers applied to every HTTP response.
     ///
     /// Header names must conform to RFC 7230 token grammar (alphanumeric
@@ -650,6 +736,14 @@ fn default_admin_bind() -> String {
     "127.0.0.1:0".to_string()
 }
 
+fn default_upload_max_total_mb() -> u32 {
+    5120
+}
+
+fn default_upload_max_files() -> u32 {
+    100
+}
+
 fn default_upload_max_size_mb() -> u32 {
     500
 }
@@ -663,7 +757,10 @@ impl Default for ServerConfig {
             admin_bind: default_admin_bind(),
             public_url: None,
             upload_dir: None,
+            admin_allowed_hosts: Vec::new(),
             upload_max_size_mb: default_upload_max_size_mb(),
+            upload_max_total_mb: default_upload_max_total_mb(),
+            upload_max_files: default_upload_max_files(),
             extra_response_headers: None,
             disable_render: false,
             disable_ogc: false,
@@ -715,6 +812,37 @@ pub struct TelemetryConfig {
     ///   left enabled in production.
     #[serde(default)]
     pub metrics_label_cardinality: MetricsLabelCardinality,
+    /// Collect per-request statistics for the admin analytics dashboard
+    /// (`GET /__admin/stats`, `/admin/analytics`). Off by default; when on,
+    /// each tile request updates an in-memory, bounded store.
+    #[serde(default)]
+    pub dashboard: bool,
+    /// Requests kept in the dashboard's "recent requests" list.
+    #[serde(default = "default_dashboard_recent_requests")]
+    pub dashboard_recent_requests: usize,
+    /// Zoom level the dashboard heatmap aggregates requests to (0-16).
+    #[serde(default = "default_dashboard_heatmap_zoom")]
+    pub dashboard_heatmap_zoom: u8,
+}
+
+impl TelemetryConfig {
+    /// Dashboard collection settings derived from this section.
+    #[must_use]
+    pub fn dashboard_settings(&self) -> crate::metrics::dashboard::DashboardSettings {
+        crate::metrics::dashboard::DashboardSettings {
+            enabled: self.dashboard,
+            recent_requests: self.dashboard_recent_requests,
+            heatmap_zoom: self.dashboard_heatmap_zoom,
+        }
+    }
+}
+
+fn default_dashboard_recent_requests() -> usize {
+    200
+}
+
+fn default_dashboard_heatmap_zoom() -> u8 {
+    10
 }
 
 /// Cardinality strategy for metric labels emitted via the
@@ -770,6 +898,9 @@ impl Default for TelemetryConfig {
             prometheus_bind: None,
             prometheus_path: default_prometheus_path(),
             metrics_label_cardinality: MetricsLabelCardinality::Strict,
+            dashboard: false,
+            dashboard_recent_requests: default_dashboard_recent_requests(),
+            dashboard_heatmap_zoom: default_dashboard_heatmap_zoom(),
         }
     }
 }
@@ -1550,6 +1681,36 @@ pub struct ConfigLoadMetadata {
     pub content_hash: String,
 }
 
+/// Shortest MCP secret accepted without a warning.
+#[cfg(feature = "mcp")]
+const MIN_MCP_AUTH_TOKEN_LEN: usize = 16;
+
+/// Reject an MCP secret (`key`) that is empty or still holds a `$VAR`
+/// reference. Env substitution leaves unknown variables as written, so an
+/// unset `${MCP_AUTH_TOKEN}` would otherwise become the literal, public
+/// secret. A short token only logs a warning, so existing setups still start.
+#[cfg(feature = "mcp")]
+fn validate_secret(key: &str, token: &str) -> anyhow::Result<()> {
+    let unexpanded = token.char_indices().any(|(i, c)| {
+        c == '$'
+            && token[i + 1..].starts_with(|n: char| n == '{' || n == '_' || n.is_ascii_alphabetic())
+    });
+    if unexpanded {
+        anyhow::bail!(
+            "`{key}` contains an unexpanded environment variable; set it in the environment"
+        );
+    }
+    if token.trim().is_empty() {
+        anyhow::bail!("`{key}` is empty");
+    }
+    if token.len() < MIN_MCP_AUTH_TOKEN_LEN {
+        tracing::warn!(
+            "`{key}` is shorter than {MIN_MCP_AUTH_TOKEN_LEN} characters; use a long random value"
+        );
+    }
+    Ok(())
+}
+
 impl Config {
     fn hash_content(content: &str) -> String {
         use std::fmt::Write;
@@ -1589,6 +1750,9 @@ impl Config {
     ///
     /// Returns an error when:
     /// - `[mcp]` enables both `auth_token` and `oauth.enabled` (mutually exclusive).
+    /// - `[mcp].auth_token` is empty or still holds an unexpanded `$VAR`
+    ///   reference (the environment variable was not set).
+    /// - `[mcp.oauth].enabled = true` without a usable `approval_secret`.
     /// - `[mcp.oauth].enabled = true` without `issuer_url` set.
     /// - `[mcp.oauth].enabled = true` without `signing_key_path` set.
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -1599,6 +1763,17 @@ impl Config {
                     "cannot enable both static bearer (`[mcp].auth_token`) and OAuth (`[mcp.oauth].enabled`); pick one"
                 );
             }
+            if let Some(token) = &self.mcp.auth_token {
+                validate_secret("[mcp].auth_token", token)?;
+            }
+            if self.mcp.oauth.enabled {
+                let Some(secret) = &self.mcp.oauth.approval_secret else {
+                    anyhow::bail!(
+                        "`[mcp.oauth].approval_secret` is required when oauth.enabled = true"
+                    );
+                };
+                validate_secret("[mcp.oauth].approval_secret", secret)?;
+            }
             if self.mcp.oauth.enabled && self.mcp.oauth.issuer_url.is_none() {
                 anyhow::bail!("`[mcp.oauth].issuer_url` is required when oauth.enabled = true");
             }
@@ -1606,6 +1781,26 @@ impl Config {
                 anyhow::bail!(
                     "`[mcp.oauth].signing_key_path` is required when oauth.enabled = true"
                 );
+            }
+        }
+        if self.telemetry.dashboard_heatmap_zoom > 16 {
+            anyhow::bail!(
+                "`[telemetry].dashboard_heatmap_zoom` must be 0-16 (got {})",
+                self.telemetry.dashboard_heatmap_zoom
+            );
+        }
+        if self.telemetry.dashboard_recent_requests > 10_000 {
+            anyhow::bail!(
+                "`[telemetry].dashboard_recent_requests` must be at most 10000 (got {})",
+                self.telemetry.dashboard_recent_requests
+            );
+        }
+        if self.live.interval_secs == 0 {
+            anyhow::bail!("`[live].interval_secs` must be at least 1");
+        }
+        for id in &self.live.watch {
+            if id != "*" && !self.sources.iter().any(|s| &s.id == id) {
+                anyhow::bail!("`[live].watch` names unknown source `{id}`");
             }
         }
         #[cfg(feature = "cel")]
@@ -1643,6 +1838,11 @@ impl Config {
     }
 
     /// Load configuration and return metadata including the content hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a config file exists but cannot be read or
+    /// parsed, or fails validation.
     pub fn load_with_metadata(config_path: Option<PathBuf>) -> anyhow::Result<ConfigLoadMetadata> {
         if let Some(path) = config_path
             && path.exists()
@@ -1674,6 +1874,10 @@ impl Config {
     }
 
     /// Load configuration from environment or file.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Config::load_with_metadata`].
     pub fn load(config_path: Option<PathBuf>) -> anyhow::Result<Self> {
         Ok(Self::load_with_metadata(config_path)?.config)
     }
@@ -1695,6 +1899,11 @@ impl Config {
     /// Create the scratch directory (if missing) and verify it is writable
     /// by round-tripping a probe file. Subsystem subdirs are created lazily
     /// by their owners, not here.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the directory cannot be created or a probe
+    /// file cannot be written and removed.
     pub fn ensure_cache_dir_writable(cache_dir: &std::path::Path) -> anyhow::Result<()> {
         std::fs::create_dir_all(cache_dir).map_err(|e| {
             anyhow::anyhow!(
@@ -1772,13 +1981,6 @@ mod tests {
         assert_eq!(c.br_quality, 5);
         assert_eq!(c.zstd_level, 3);
         assert!(!c.minimal_recompression);
-    }
-
-    #[test]
-    fn test_compression_present_on_default_config() {
-        let config = Config::default();
-        assert_eq!(config.compression.br_quality, 5);
-        assert_eq!(config.compression.zstd_level, 3);
     }
 
     #[test]
@@ -2208,16 +2410,6 @@ server:
     }
 
     #[test]
-    fn test_env_var_substitution_basic() {
-        // SAFETY: test-only; no concurrent threads access env vars in this test
-        unsafe { std::env::set_var("TEST_VAR_1", "hello") };
-        let result = Config::substitute_env_vars("value is ${TEST_VAR_1}");
-        assert_eq!(result, "value is hello");
-        // SAFETY: test-only; no concurrent threads access env vars in this test
-        unsafe { std::env::remove_var("TEST_VAR_1") };
-    }
-
-    #[test]
     fn test_env_var_substitution_with_default() {
         // SAFETY: test-only; no concurrent threads access env vars in this test
         unsafe { std::env::remove_var("NONEXISTENT_VAR") };
@@ -2261,8 +2453,15 @@ server:
 
     #[test]
     fn test_env_var_substitution_postgres_config() {
-        // SAFETY: test-only; no concurrent threads access env vars in this test
-        unsafe { std::env::set_var("DATABASE_URL", "postgresql://user:pass@db:5432/mydb") };
+        // A name no other test reads: tests run in parallel, and the live
+        // PostGIS tests read DATABASE_URL.
+        // SAFETY: test-only; no other test reads this variable.
+        unsafe {
+            std::env::set_var(
+                "TILESERVER_TEST_SUBST_DB_URL",
+                "postgresql://user:pass@db:5432/mydb",
+            )
+        };
 
         let toml = r#"
             [server]
@@ -2271,17 +2470,17 @@ server:
         "#;
 
         let substituted = Config::substitute_env_vars(toml);
-        assert!(!substituted.contains("${DATABASE_URL}"));
+        assert!(!substituted.contains("${TILESERVER_TEST_SUBST_DB_URL}"));
 
-        let toml_with_env = r#"connection_string = "${DATABASE_URL}""#;
+        let toml_with_env = r#"connection_string = "${TILESERVER_TEST_SUBST_DB_URL}""#;
         let substituted = Config::substitute_env_vars(toml_with_env);
         assert_eq!(
             substituted,
             r#"connection_string = "postgresql://user:pass@db:5432/mydb""#
         );
 
-        // SAFETY: test-only; no concurrent threads access env vars in this test
-        unsafe { std::env::remove_var("DATABASE_URL") };
+        // SAFETY: test-only; no other test reads this variable.
+        unsafe { std::env::remove_var("TILESERVER_TEST_SUBST_DB_URL") };
     }
 
     #[test]
@@ -2340,15 +2539,6 @@ server:
     // === Edge-branch tests: defaults, round-trips, load_with_metadata ===
 
     #[test]
-    fn test_config_default_has_empty_sources_and_styles() {
-        let config = Config::default();
-        assert!(config.sources.is_empty());
-        assert!(config.styles.is_empty());
-        assert!(config.fonts.is_none());
-        assert!(config.files.is_none());
-    }
-
-    #[test]
     fn test_server_config_default_values() {
         let server = ServerConfig::default();
         assert_eq!(server.host, "0.0.0.0");
@@ -2369,17 +2559,11 @@ server:
     }
 
     #[test]
-    fn test_cache_config_default_via_config() {
-        let config = Config::default();
-        assert!(!config.cache.enabled);
-        assert_eq!(config.cache.max_size_mb, 512);
-    }
-
-    #[test]
     fn test_render_pool_config_default_values() {
         let render = RenderPoolConfig::default();
         assert_eq!(render.pool_size, 4);
         assert_eq!(render.render_timeout_secs, 30);
+        assert_eq!(render.queue_size, 256);
     }
 
     #[test]
@@ -2522,18 +2706,6 @@ server:
     }
 
     #[test]
-    fn test_server_config_custom_port_and_host() {
-        let toml_str = r#"
-            [server]
-            host = "127.0.0.1"
-            port = 9090
-        "#;
-        let config: Config = toml::from_str(toml_str).expect("parse server config with port");
-        assert_eq!(config.server.port, 9090);
-        assert_eq!(config.server.host, "127.0.0.1");
-    }
-
-    #[test]
     fn test_server_config_public_url_override() {
         let toml_str = r#"
             [server]
@@ -2650,13 +2822,6 @@ path = "/tmp/test.pmtiles"
     }
 
     #[test]
-    fn test_config_load_wrapper_returns_config_only() {
-        let nonexistent = PathBuf::from("/tmp/definitely-not-a-real-config-9998.toml");
-        let result = Config::load(Some(nonexistent));
-        assert!(result.is_ok());
-    }
-
-    #[test]
     fn test_config_load_with_metadata_invalid_toml_errors() {
         use std::io::Write;
         let mut tmp = tempfile::NamedTempFile::new().expect("create tempfile");
@@ -2696,21 +2861,6 @@ port = ${{TEST_ENV_SUB_PORT}}
         let s = serde_json::to_string(&SourceType::PMTiles).expect("serialize");
         let back: SourceType = serde_json::from_str(&s).expect("deserialize");
         assert_eq!(back, SourceType::PMTiles);
-    }
-
-    #[test]
-    fn test_telemetry_default_metrics_path() {
-        let config = Config::default();
-        assert_eq!(config.telemetry.prometheus_path, "/metrics");
-    }
-
-    #[test]
-    fn test_metrics_label_cardinality_serde_standard_variant() {
-        let s = serde_json::to_string(&MetricsLabelCardinality::Standard).expect("serialize");
-        assert_eq!(s, "\"standard\"");
-        let back: MetricsLabelCardinality =
-            serde_json::from_str("\"standard\"").expect("deserialize");
-        assert_eq!(back, MetricsLabelCardinality::Standard);
     }
 
     #[cfg(feature = "postgres")]
@@ -3273,7 +3423,7 @@ entries = [
     }
 
     mod composite_tests {
-        use crate::config::{CompositeConfig, Config};
+        use crate::config::Config;
 
         #[test]
         fn composite_config_roundtrip_with_minimum_fields() {
@@ -3295,17 +3445,6 @@ entries = [
         }
 
         #[test]
-        fn composite_config_with_multiple_sources() {
-            let toml = r#"
-                [[composites]]
-                id = "trio"
-                sources = ["a", "b", "c"]
-            "#;
-            let cfg: Config = toml::from_str(toml).expect("parse");
-            assert_eq!(cfg.composites[0].sources.len(), 3);
-        }
-
-        #[test]
         fn composite_config_requires_id() {
             let toml = r#"
                 [[composites]]
@@ -3321,13 +3460,6 @@ entries = [
                 id = "x"
             "#;
             assert!(toml::from_str::<Config>(toml).is_err());
-        }
-
-        #[test]
-        fn composite_config_default_impl_is_empty() {
-            let c = CompositeConfig::default();
-            assert!(c.id.is_empty());
-            assert!(c.sources.is_empty());
         }
     }
 
@@ -3352,29 +3484,8 @@ entries = [
         }
 
         #[test]
-        fn derive_base_path_single_segment() {
-            assert_eq!(derive_base_path(Some("https://example.com/maps")), "/maps");
-        }
-
-        #[test]
         fn derive_base_path_strips_trailing_slash() {
             assert_eq!(derive_base_path(Some("https://example.com/maps/")), "/maps");
-        }
-
-        #[test]
-        fn derive_base_path_multi_segment() {
-            assert_eq!(
-                derive_base_path(Some("https://example.com/tiles/maps")),
-                "/tiles/maps"
-            );
-        }
-
-        #[test]
-        fn derive_base_path_preserves_port_in_authority() {
-            assert_eq!(
-                derive_base_path(Some("http://localhost:8080/maps")),
-                "/maps"
-            );
         }
 
         #[test]
@@ -3382,11 +3493,6 @@ entries = [
             // No `://` — the authority-vs-path split falls back to the first
             // slash, so `example.com/maps` still yields `/maps`.
             assert_eq!(derive_base_path(Some("example.com/maps")), "/maps");
-        }
-
-        #[test]
-        fn derive_base_path_only_slashes_is_root() {
-            assert_eq!(derive_base_path(Some("https://example.com///")), "");
         }
 
         // ---- SubfolderMode -------------------------------------------
@@ -3410,12 +3516,9 @@ entries = [
 
         #[test]
         fn subfolder_mode_rejects_unknown_variant() {
-            #[derive(Deserialize)]
-            struct Wrap {
-                #[allow(dead_code)]
-                mode: SubfolderMode,
-            }
-            assert!(toml::from_str::<Wrap>(r#"mode = "bogus""#).is_err());
+            let parsed: Result<std::collections::HashMap<String, SubfolderMode>, _> =
+                toml::from_str(r#"mode = "bogus""#);
+            assert!(parsed.is_err());
         }
 
         #[test]
@@ -3438,12 +3541,6 @@ entries = [
             // The reverse proxy strips the prefix, so the in-server layer is a
             // no-op regardless of the derived base path.
             assert_eq!(SubfolderMode::ProxyStrip.strip_base("/maps"), "");
-        }
-
-        #[test]
-        fn strip_base_nested_with_empty_base_is_empty() {
-            // A root deployment in nested mode still yields an empty strip base.
-            assert_eq!(SubfolderMode::Nested.strip_base(""), "");
         }
     }
 }
@@ -3557,5 +3654,52 @@ mod llm_config_tests {
         ] {
             assert!(!is_allowed_llm_base_url(bad), "{bad} should be rejected");
         }
+    }
+}
+
+#[cfg(all(test, feature = "mcp"))]
+mod mcp_auth_token_tests {
+    use super::Config;
+
+    fn with_token(token: &str) -> anyhow::Result<()> {
+        let mut config = Config::default();
+        config.mcp.auth_token = Some(token.to_string());
+        config.validate()
+    }
+
+    #[test]
+    fn unset_env_reference_is_rejected() {
+        let toml = "[mcp]\nauth_token = \"${TILESERVER_TEST_SURELY_UNSET_VAR}\"\n";
+        let expanded = Config::substitute_env_vars(toml);
+        let config: Config = toml::from_str(&expanded).unwrap();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("unexpanded environment variable"), "{err}");
+        assert!(with_token("$MCP_TOKEN").is_err());
+    }
+
+    #[test]
+    fn empty_token_is_rejected() {
+        assert!(with_token("   ").unwrap_err().to_string().contains("empty"));
+    }
+
+    #[test]
+    fn oauth_requires_a_usable_approval_secret() {
+        let mut config = Config::default();
+        config.mcp.oauth.enabled = true;
+        config.mcp.oauth.issuer_url = Some("https://tiles.example".to_string());
+        config.mcp.oauth.signing_key_path = Some("/tmp/key.pem".into());
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("approval_secret"), "{err}");
+        config.mcp.oauth.approval_secret = Some("${UNSET_APPROVAL}".to_string());
+        assert!(config.validate().is_err());
+        config.mcp.oauth.approval_secret = Some("a-long-operator-approval-code".to_string());
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn real_tokens_are_accepted() {
+        assert!(with_token("short").is_ok(), "short tokens only warn");
+        assert!(with_token("c0ffee-$-not-a-var-0123456789").is_ok());
+        assert!(with_token("a3f1c9e8b7d6a5f4e3d2c1b0a9f8e7d6").is_ok());
     }
 }

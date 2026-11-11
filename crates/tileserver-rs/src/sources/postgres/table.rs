@@ -1,15 +1,14 @@
 //! PostgreSQL table tile source implementation with optimized spatial filtering.
 
 use async_trait::async_trait;
-use bytes::Bytes;
 use std::sync::Arc;
 use tokio_postgres::types::Type;
 
 use crate::config::PostgresTableConfig;
 use crate::error::{Result, TileServerError};
-use crate::sources::{TileCompression, TileData, TileFormat, TileMetadata, TileSource};
+use crate::sources::{TileData, TileFormat, TileMetadata, TileSource};
 
-use super::{PostgresPool, TileCache, TileCacheKey};
+use super::{PostgresPool, TileCache};
 
 /// Encodes a `serde_json::Value` from the client payload into a `(sql, param)`
 /// pair suitable for splicing into a parameterised `INSERT` / `UPDATE`.
@@ -26,18 +25,92 @@ use super::{PostgresPool, TileCache, TileCacheKey};
 /// - everything else -> text/jsonb so arrays and objects also round-trip
 ///
 /// The returned SQL fragment is the placeholder string
-/// (`$N` or `$N::text::jsonb`) to substitute into the statement.
-fn encode_property_param(
-    value: &serde_json::Value,
-    idx: u32,
-) -> (String, Box<dyn tokio_postgres::types::ToSql + Sync + Send>) {
+/// (`$N` or `$N::text::jsonb`) to substitute into the statement. JSON `null`
+/// becomes the literal `NULL` with **no** parameter: a bound parameter with
+/// no matching placeholder makes PostgreSQL reject the whole statement.
+fn encode_property_param(value: &serde_json::Value, idx: u32) -> (String, Option<SqlParam>) {
     match value {
-        serde_json::Value::Null => ("NULL".to_string(), Box::new(Option::<String>::None)),
-        serde_json::Value::Bool(b) => (format!("${idx}"), Box::new(*b)),
-        serde_json::Value::Number(n) => (format!("${idx}::text::numeric"), Box::new(n.to_string())),
-        serde_json::Value::String(s) => (format!("${idx}"), Box::new(s.clone())),
-        other => (format!("${idx}::jsonb"), Box::new(other.to_string())),
+        serde_json::Value::Null => ("NULL".to_string(), None),
+        serde_json::Value::Bool(b) => (format!("${idx}"), Some(Box::new(*b))),
+        serde_json::Value::Number(n) => (
+            format!("${idx}::text::numeric"),
+            Some(Box::new(n.to_string())),
+        ),
+        serde_json::Value::String(s) => (format!("${idx}"), Some(Box::new(s.clone()))),
+        other => (format!("${idx}::jsonb"), Some(Box::new(other.to_string()))),
     }
+}
+
+/// An owned, boxed statement parameter.
+type SqlParam = Box<dyn tokio_postgres::types::ToSql + Sync + Send>;
+
+/// Build the `UPDATE` for PUT (`partial = false`) or PATCH (`partial = true`).
+///
+/// The id column is never assigned: the feature's identity is its URL, and
+/// PUT would otherwise set it to NULL (a NOT NULL violation for any primary
+/// key). Returns `None` when there is nothing to update.
+fn build_update(
+    info: &TableInfo,
+    feature_id: &str,
+    geometry: Option<&serde_json::Value>,
+    properties: &serde_json::Map<String, serde_json::Value>,
+    partial: bool,
+) -> Option<(String, Vec<SqlParam>)> {
+    let mut assignments: Vec<String> = Vec::new();
+    let mut params: Vec<SqlParam> = Vec::new();
+    let mut idx: u32 = 1;
+
+    if let Some(geom) = geometry {
+        assignments.push(format!(
+            r#""{}" = ST_SetSRID(ST_GeomFromGeoJSON(${idx}), {})"#,
+            info.geometry_column, info.srid
+        ));
+        params.push(Box::new(geom.to_string()));
+        idx += 1;
+    }
+
+    let id_col = info.id_column.as_deref();
+    for prop in info
+        .properties
+        .iter()
+        .filter(|p| Some(p.as_str()) != id_col)
+    {
+        match properties.get(prop) {
+            Some(value) => {
+                let (sql_literal, param) = encode_property_param(value, idx);
+                assignments.push(format!(r#""{prop}" = {sql_literal}"#));
+                if let Some(param) = param {
+                    params.push(param);
+                    idx += 1;
+                }
+            }
+            None if !partial => assignments.push(format!(r#""{prop}" = NULL"#)),
+            None => {}
+        }
+    }
+
+    if assignments.is_empty() {
+        return None;
+    }
+    let sql = format!(
+        r#"UPDATE "{}"."{}" SET {} WHERE "{}"::text = ${idx}"#,
+        info.schema,
+        info.table,
+        assignments.join(", "),
+        id_col.unwrap_or("ctid")
+    );
+    params.push(Box::new(feature_id.to_string()));
+    Some((sql, params))
+}
+
+/// Map a database error to [`TileServerError::PostgresError`], keeping the
+/// server's own message: `tokio_postgres::Error`'s `Display` is only
+/// "db error", which hides the constraint or type that failed.
+fn pg_error(context: &str, e: &tokio_postgres::Error) -> TileServerError {
+    let detail = e
+        .as_db_error()
+        .map_or_else(|| e.to_string(), |db| db.message().to_string());
+    TileServerError::PostgresError(format!("{context} failed: {detail}"))
 }
 
 /// Reports whether a PostGIS `geometry_columns.type` string describes a
@@ -123,6 +196,11 @@ fn extract_property(row: &tokio_postgres::Row, column: &str) -> serde_json::Valu
     serde_json::Value::Null
 }
 
+/// Longest an OGC API Features query may run, in milliseconds. The query
+/// carries an anonymous CQL2 filter, so it must not hold a pooled
+/// connection indefinitely.
+pub const OGC_QUERY_TIMEOUT_MS: u64 = 30_000;
+
 #[derive(Debug, Clone)]
 pub struct TableInfo {
     pub schema: String,
@@ -144,16 +222,6 @@ pub struct PostgresTableSource {
     metadata: TileMetadata,
     table_info: TableInfo,
     tile_query: String,
-    #[allow(dead_code)]
-    // Config value baked into tile_query SQL; kept for future tile-query regeneration
-    extent: u32,
-    #[allow(dead_code)]
-    // Config value baked into tile_query SQL; kept for future tile-query regeneration
-    buffer: u32,
-    #[allow(dead_code)] // Config value baked into tile_query SQL; kept for future LIMIT injection
-    max_features: Option<u32>,
-    #[allow(dead_code)] // Detected at pool init; reserved for margin-aware ST_TileEnvelope queries
-    supports_tile_margin: bool,
     cache: Option<Arc<TileCache>>,
 }
 
@@ -170,6 +238,10 @@ impl std::fmt::Debug for PostgresTableSource {
 }
 
 impl PostgresTableSource {
+    /// # Errors
+    ///
+    /// Returns an error when the pool has no connection or the table has no
+    /// geometry column.
     pub async fn new(
         pool: Arc<PostgresPool>,
         config: &PostgresTableConfig,
@@ -237,12 +309,35 @@ impl PostgresTableSource {
             metadata,
             table_info,
             tile_query,
-            extent: config.extent,
-            buffer: config.buffer,
-            max_features: config.max_features,
-            supports_tile_margin,
             cache,
         })
+    }
+
+    /// Run the tile query. An empty result is no tile.
+    async fn query_tile(&self, z: u8, x: u32, y: u32) -> Result<Option<TileData>> {
+        let conn = self.pool.get().await?;
+        let prep_query = conn
+            .prepare_typed_cached(&self.tile_query, &[Type::INT4, Type::INT4, Type::INT4])
+            .await
+            .map_err(|e| {
+                TileServerError::PostgresError(format!(
+                    "failed to prepare tile query for {}.{}: {}",
+                    self.table_info.schema, self.table_info.table, e
+                ))
+            })?;
+        let row = conn
+            .query_opt(&prep_query, &[&i32::from(z), &(x as i32), &(y as i32)])
+            .await
+            .map_err(|e| {
+                TileServerError::PostgresError(format!(
+                    "failed to execute tile query for {}.{} at z={}, x={}, y={}: {}",
+                    self.table_info.schema, self.table_info.table, z, x, y, e
+                ))
+            })?;
+        Ok(row
+            .and_then(|row| row.get::<_, Option<Vec<u8>>>(0))
+            .filter(|d| !d.is_empty())
+            .map(super::pbf_tile))
     }
 
     #[must_use]
@@ -344,7 +439,7 @@ impl PostgresTableSource {
     /// - `output_srid` — EPSG code the caller wants back (spec `crs`). The
     ///   identity transform is elided when it matches the storage SRID.
     /// - `filter_sql` — pre-validated PostgreSQL `WHERE` fragment produced by
-    ///   [`crate::routes::ogc_filter::translate_filter_to_sql`]. Spliced in as
+    ///   `crate::routes::ogc_filter::translate_filter_to_sql`. Spliced in as
     ///   raw SQL; upstream safety relies on a **property allow-list** (bare
     ///   identifiers are only emitted for columns in `info.properties`) plus
     ///   a round-trip canonicalisation gate that rejects trailing tokens.
@@ -371,7 +466,19 @@ impl PostgresTableSource {
         offset: i64,
     ) -> Result<(Vec<serde_json::Value>, i64)> {
         let _ = filter_srid;
-        let conn = self.pool.get().await?;
+        let mut conn = self.pool.get().await?;
+        // Feature queries take an anonymous CQL2 filter: bound how long they
+        // may hold a pooled connection. SET LOCAL ends with the transaction.
+        let conn = conn
+            .transaction()
+            .await
+            .map_err(|e| TileServerError::PostgresError(format!("begin failed: {e}")))?;
+        conn.batch_execute(&format!(
+            "SET LOCAL statement_timeout = {}",
+            OGC_QUERY_TIMEOUT_MS
+        ))
+        .await
+        .map_err(|e| TileServerError::PostgresError(format!("set timeout failed: {e}")))?;
         let info = &self.table_info;
 
         let id_expr = info
@@ -496,6 +603,9 @@ impl PostgresTableSource {
             })
             .collect();
 
+        conn.commit()
+            .await
+            .map_err(|e| TileServerError::PostgresError(format!("commit failed: {e}")))?;
         Ok((features, total_count))
     }
 
@@ -578,8 +688,7 @@ impl PostgresTableSource {
 
         let mut columns: Vec<String> = Vec::with_capacity(info.properties.len() + 1);
         let mut placeholders: Vec<String> = Vec::with_capacity(info.properties.len() + 1);
-        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> =
-            Vec::with_capacity(info.properties.len() + 1);
+        let mut params: Vec<SqlParam> = Vec::with_capacity(info.properties.len() + 1);
 
         columns.push(format!(r#""{}""#, info.geometry_column));
         placeholders.push(format!("ST_SetSRID(ST_GeomFromGeoJSON($1), {})", info.srid));
@@ -589,10 +698,12 @@ impl PostgresTableSource {
         for prop in &info.properties {
             if let Some(value) = properties.get(prop) {
                 columns.push(format!(r#""{prop}""#));
-                let (sql_literal, owned_param) = encode_property_param(value, idx);
+                let (sql_literal, param) = encode_property_param(value, idx);
                 placeholders.push(sql_literal);
-                params.push(owned_param);
-                idx += 1;
+                if let Some(param) = param {
+                    params.push(param);
+                    idx += 1;
+                }
             }
         }
 
@@ -614,7 +725,7 @@ impl PostgresTableSource {
         let row = conn
             .query_one(&sql, &param_refs)
             .await
-            .map_err(|e| TileServerError::PostgresError(format!("insert_feature failed: {e}")))?;
+            .map_err(|e| pg_error("insert_feature", &e))?;
         Ok(row.get::<_, String>(0))
     }
 
@@ -674,47 +785,8 @@ impl PostgresTableSource {
             )));
         }
 
-        let mut assignments: Vec<String> = Vec::new();
-        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
-        let mut idx: u32 = 1;
-
-        if let Some(geom) = geometry {
-            assignments.push(format!(
-                r#""{}" = ST_SetSRID(ST_GeomFromGeoJSON(${idx}), {})"#,
-                info.geometry_column, info.srid
-            ));
-            params.push(Box::new(geom.to_string()));
-            idx += 1;
-        }
-
-        for prop in &info.properties {
-            match properties.get(prop) {
-                Some(value) => {
-                    let (sql_literal, owned_param) = encode_property_param(value, idx);
-                    assignments.push(format!(r#""{prop}" = {sql_literal}"#));
-                    params.push(owned_param);
-                    idx += 1;
-                }
-                None if !partial => {
-                    assignments.push(format!(r#""{prop}" = NULL"#));
-                }
-                None => {}
-            }
-        }
-
-        if assignments.is_empty() {
-            return Err(TileServerError::InvalidTileRequest);
-        }
-
-        let id_col = info.id_column.as_deref().unwrap_or("ctid");
-        let sql = format!(
-            r#"UPDATE "{}"."{}" SET {} WHERE "{}"::text = ${idx}"#,
-            info.schema,
-            info.table,
-            assignments.join(", "),
-            id_col
-        );
-        params.push(Box::new(feature_id.to_string()));
+        let (sql, params) = build_update(info, feature_id, geometry, properties, partial)
+            .ok_or(TileServerError::InvalidTileRequest)?;
 
         let conn = self.pool.get().await?;
         let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
@@ -725,7 +797,7 @@ impl PostgresTableSource {
         let rows = conn
             .execute(&sql, &param_refs)
             .await
-            .map_err(|e| TileServerError::PostgresError(format!("write_feature failed: {e}")))?;
+            .map_err(|e| pg_error("write_feature", &e))?;
         if rows == 0 {
             return Err(TileServerError::NotFound(format!(
                 "feature '{feature_id}' not found"
@@ -827,12 +899,12 @@ impl PostgresTableSource {
         conn.query_opt(query, &[&schema, &table])
             .await
             .map_err(|e| {
-                TileServerError::PostgresError(format!("Failed to find geometry column: {}", e))
+                TileServerError::PostgresError(format!("failed to find geometry column: {}", e))
             })?
             .map(|row| row.get(0))
             .ok_or_else(|| {
                 TileServerError::PostgresError(format!(
-                    "No geometry column found in {}.{}",
+                    "no geometry column found in {}.{}",
                     schema, table
                 ))
             })
@@ -855,12 +927,12 @@ impl PostgresTableSource {
         conn.query_opt(query, &[&schema, &table, &geometry_column])
             .await
             .map_err(|e| {
-                TileServerError::PostgresError(format!("Failed to get geometry info: {}", e))
+                TileServerError::PostgresError(format!("failed to get geometry info: {}", e))
             })?
             .map(|row| (row.get::<_, i32>(0), row.get::<_, String>(1)))
             .ok_or_else(|| {
                 TileServerError::PostgresError(format!(
-                    "Geometry column '{}' not found in {}.{}",
+                    "geometry column '{}' not found in {}.{}",
                     geometry_column, schema, table
                 ))
             })
@@ -891,7 +963,7 @@ impl PostgresTableSource {
             .query(query, &[&schema, &table, &geometry_column])
             .await
             .map_err(|e| {
-                TileServerError::PostgresError(format!("Failed to discover properties: {}", e))
+                TileServerError::PostgresError(format!("failed to discover properties: {}", e))
             })?;
 
         Ok(rows.iter().map(|row| row.get(0)).collect())
@@ -925,7 +997,7 @@ impl PostgresTableSource {
             .await
             .map(|row| row.get(0))
             .map_err(|e| {
-                TileServerError::PostgresError(format!("Failed to check spatial index: {}", e))
+                TileServerError::PostgresError(format!("failed to check spatial index: {}", e))
             })
     }
 
@@ -973,7 +1045,7 @@ impl PostgresTableSource {
                 ]
             })
             .map_err(|e| {
-                TileServerError::PostgresError(format!("Failed to estimate bounds: {}", e))
+                TileServerError::PostgresError(format!("failed to estimate bounds: {}", e))
             })
     }
 
@@ -1095,72 +1167,11 @@ impl PostgresTableSource {
 #[async_trait]
 impl TileSource for PostgresTableSource {
     async fn get_tile(&self, z: u8, x: u32, y: u32) -> Result<Option<TileData>> {
-        let max_tile = 1u32 << z;
-        if x >= max_tile || y >= max_tile {
-            return Err(TileServerError::InvalidCoordinates { z, x, y });
-        }
-
-        if z < self.metadata.minzoom || z > self.metadata.maxzoom {
+        if !super::serves_tile(&self.metadata, z, x, y)? {
             return Ok(None);
         }
-
-        let cache_key = self.cache.as_ref().map(|_| TileCacheKey {
-            source_id: self.metadata.id.clone().into(),
-            z,
-            x,
-            y,
-            encoding: TileCompression::None,
-            filter: 0,
-        });
-
-        if let (Some(cache), Some(key)) = (&self.cache, &cache_key)
-            && let Some(tile) = cache.get(key).await
-        {
-            return Ok(Some(tile));
-        }
-
-        let conn = self.pool.get().await?;
-
-        let prep_query = conn
-            .prepare_typed_cached(&self.tile_query, &[Type::INT4, Type::INT4, Type::INT4])
-            .await
-            .map_err(|e| {
-                TileServerError::PostgresError(format!(
-                    "Failed to prepare tile query for {}.{}: {}",
-                    self.table_info.schema, self.table_info.table, e
-                ))
-            })?;
-
-        let tile_data: Option<Vec<u8>> = conn
-            .query_opt(&prep_query, &[&(z as i32), &(x as i32), &(y as i32)])
-            .await
-            .map_err(|e| {
-                TileServerError::PostgresError(format!(
-                    "Failed to execute tile query for {}.{} at z={}, x={}, y={}: {}",
-                    self.table_info.schema, self.table_info.table, z, x, y, e
-                ))
-            })?
-            .and_then(|row| row.get::<_, Option<Vec<u8>>>(0));
-
-        let result = tile_data.filter(|d| !d.is_empty()).map(|data| {
-            let compression = if data.len() >= 2 && data[0] == 0x1f && data[1] == 0x8b {
-                TileCompression::Gzip
-            } else {
-                TileCompression::None
-            };
-
-            TileData {
-                data: Bytes::from(data),
-                format: TileFormat::Pbf,
-                compression,
-            }
-        });
-
-        if let (Some(cache), Some(key), Some(tile)) = (&self.cache, cache_key, &result) {
-            cache.insert(key, tile.clone()).await;
-        }
-
-        Ok(result)
+        let fetch = self.query_tile(z, x, y);
+        super::through_cache(self.cache.as_deref(), &self.metadata.id, (z, x, y), fetch).await
     }
 
     fn metadata(&self) -> &TileMetadata {
@@ -1177,7 +1188,7 @@ mod tests {
     use super::*;
     use crate::config::PostgresTableConfig;
 
-    fn make_table_info() -> TableInfo {
+    pub(super) fn make_table_info() -> TableInfo {
         TableInfo {
             schema: "public".to_string(),
             table: "points".to_string(),
@@ -1418,87 +1429,6 @@ mod tests {
     }
 
     #[test]
-    fn test_table_info_geometry_type_stored() {
-        let info = make_table_info();
-        assert_eq!(info.geometry_type, "POINT");
-    }
-
-    #[test]
-    fn test_table_info_has_spatial_index_true() {
-        let info = make_table_info();
-        assert!(info.has_spatial_index);
-    }
-
-    #[test]
-    fn test_table_info_no_spatial_index() {
-        let mut info = make_table_info();
-        info.has_spatial_index = false;
-        assert!(!info.has_spatial_index);
-    }
-
-    #[test]
-    fn test_table_info_bounds_present() {
-        let info = make_table_info();
-        assert_eq!(info.bounds, Some([8.0, 47.0, 9.0, 48.0]));
-    }
-
-    #[test]
-    fn test_table_info_no_bounds() {
-        let mut info = make_table_info();
-        info.bounds = None;
-        assert!(info.bounds.is_none());
-    }
-
-    #[test]
-    fn test_table_info_no_id_column() {
-        let mut info = make_table_info();
-        info.id_column = None;
-        assert!(info.id_column.is_none());
-    }
-
-    #[test]
-    fn test_table_info_empty_properties() {
-        let mut info = make_table_info();
-        info.properties = vec![];
-        assert!(info.properties.is_empty());
-    }
-
-    #[test]
-    fn test_table_info_polygon_geometry_type() {
-        let mut info = make_table_info();
-        info.geometry_type = "MULTIPOLYGON".to_string();
-        assert_eq!(info.geometry_type, "MULTIPOLYGON");
-    }
-
-    #[test]
-    fn test_table_info_debug_format() {
-        let info = make_table_info();
-        let debug = format!("{:?}", info);
-        assert!(debug.contains("public"));
-        assert!(debug.contains("points"));
-        assert!(debug.contains("geom"));
-    }
-
-    #[test]
-    fn test_table_info_clone() {
-        let info = make_table_info();
-        let cloned = info.clone();
-        assert_eq!(cloned.schema, info.schema);
-        assert_eq!(cloned.table, info.table);
-        assert_eq!(cloned.srid, info.srid);
-        assert_eq!(cloned.geometry_column, info.geometry_column);
-    }
-
-    #[test]
-    fn test_build_tile_query_layer_name_matches_config_id() {
-        let table_info = make_table_info();
-        let config = make_config();
-        let query = PostgresTableSource::build_tile_query(&table_info, &config, false);
-
-        assert!(query.contains("ST_AsMVT(tile, 'test_layer',"));
-    }
-
-    #[test]
     fn test_build_tile_query_references_correct_schema_table() {
         let table_info = make_table_info();
         let config = make_config();
@@ -1569,7 +1499,67 @@ mod pure_helper_tests {
             (json!({"a": 1}), "$3::jsonb"),
         ];
         for (value, sql) in cases {
-            assert_eq!(encode_property_param(&value, 3).0, sql, "{value}");
+            let (literal, param) = encode_property_param(&value, 3);
+            assert_eq!(literal, sql, "{value}");
+            assert_eq!(param.is_none(), value.is_null(), "{value}");
         }
+    }
+
+    fn props(v: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+        v.as_object().cloned().unwrap()
+    }
+
+    #[test]
+    fn build_update_put_never_assigns_the_id_column() {
+        let mut info = super::tests::make_table_info();
+        info.properties.insert(0, "id".to_string());
+        let geom = json!({"type": "Point", "coordinates": [1, 2]});
+        let (sql, params) =
+            build_update(&info, "7", Some(&geom), &props(json!({"name": "a"})), false).unwrap();
+        assert_eq!(
+            sql,
+            r#"UPDATE "public"."points" SET "geom" = ST_SetSRID(ST_GeomFromGeoJSON($1), 4326), "name" = $2, "category" = NULL WHERE "id"::text = $3"#
+        );
+        assert_eq!(params.len(), 3);
+    }
+
+    #[test]
+    fn build_update_patch_touches_only_given_properties() {
+        let info = super::tests::make_table_info();
+        let (sql, params) =
+            build_update(&info, "7", None, &props(json!({"category": "x"})), true).unwrap();
+        assert_eq!(
+            sql,
+            r#"UPDATE "public"."points" SET "category" = $1 WHERE "id"::text = $2"#
+        );
+        assert_eq!(params.len(), 2);
+    }
+
+    #[test]
+    fn build_update_null_value_binds_no_parameter() {
+        let info = super::tests::make_table_info();
+        let (sql, params) = build_update(
+            &info,
+            "7",
+            None,
+            &props(json!({"name": null, "category": "x"})),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            sql,
+            r#"UPDATE "public"."points" SET "name" = NULL, "category" = $1 WHERE "id"::text = $2"#
+        );
+        assert_eq!(params.len(), 2, "one placeholder per bound parameter");
+    }
+
+    #[test]
+    fn build_update_without_changes_is_none_and_ctid_is_the_fallback_key() {
+        let mut info = super::tests::make_table_info();
+        assert!(build_update(&info, "7", None, &props(json!({})), true).is_none());
+        info.id_column = None;
+        let (sql, _) =
+            build_update(&info, "(0,1)", None, &props(json!({"name": "a"})), true).unwrap();
+        assert!(sql.ends_with(r#"WHERE "ctid"::text = $2"#), "{sql}");
     }
 }

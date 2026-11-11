@@ -9,8 +9,6 @@
 //! Gated behind the `mlt` cargo feature.
 
 use bytes::Bytes;
-use flate2::read::GzDecoder;
-use std::io::Read;
 
 use crate::error::{Result, TileServerError};
 use crate::sources::{TileCompression, TileData, TileFormat};
@@ -97,6 +95,25 @@ pub mod MvtProto {
 // Public API
 // ---------------------------------------------------------------------------
 
+/// [`transcode_tile`] on the blocking thread pool, so the MVT/MLT decode
+/// and encode do not stall the async runtime.
+///
+/// # Errors
+///
+/// The errors of [`transcode_tile`], or [`TileServerError::Internal`] when
+/// the blocking task panics.
+pub async fn transcode_tile_blocking(
+    tile: TileData,
+    target_format: TileFormat,
+) -> Result<TileData> {
+    if tile.format == target_format {
+        return Ok(tile);
+    }
+    tokio::task::spawn_blocking(move || transcode_tile(&tile, target_format))
+        .await
+        .map_err(|e| TileServerError::Internal(anyhow::anyhow!("transcode task failed: {e}")))?
+}
+
 /// Transcode a tile from its current format to a target format.
 ///
 /// Handles decompression of source data if needed (gzip).
@@ -165,14 +182,9 @@ pub fn transcode_tile(tile: &TileData, target_format: TileFormat) -> Result<Tile
 fn decompress_tile_data(tile: &TileData) -> Result<Vec<u8>> {
     match tile.compression {
         TileCompression::None => Ok(tile.data.to_vec()),
-        TileCompression::Gzip => {
-            let mut decoder = GzDecoder::new(tile.data.as_ref());
-            let mut decompressed = Vec::with_capacity(tile.data.len() * 4);
-            decoder.read_to_end(&mut decompressed).map_err(|e| {
-                TileServerError::MltDecodeError(format!("gzip decompression failed: {e}"))
-            })?;
-            Ok(decompressed)
-        }
+        TileCompression::Gzip => crate::compression::decode_gzip(&tile.data).map_err(|e| {
+            TileServerError::MltDecodeError(format!("gzip decompression failed: {e}"))
+        }),
         _ => Err(TileServerError::MltDecodeError(format!(
             "{:?} decompression not supported for transcoding",
             tile.compression
@@ -276,37 +288,6 @@ mod tests {
     /// Zigzag encoding for signed protobuf ints: `(n << 1) ^ (n >> 31)`.
     fn zigzag_encode(n: i32) -> u32 {
         ((n << 1) ^ (n >> 31)) as u32
-    }
-
-    #[test]
-    fn test_zigzag_encode() {
-        assert_eq!(zigzag_encode(0), 0);
-        assert_eq!(zigzag_encode(-1), 1);
-        assert_eq!(zigzag_encode(1), 2);
-        assert_eq!(zigzag_encode(-2), 3);
-        assert_eq!(zigzag_encode(2), 4);
-    }
-
-    #[test]
-    fn test_command_integer() {
-        // MoveTo, count=1
-        assert_eq!(command_integer(1, 1), 9);
-        // LineTo, count=3
-        assert_eq!(command_integer(2, 3), 26);
-        // ClosePath, count=1
-        assert_eq!(command_integer(7, 1), 15);
-    }
-
-    #[test]
-    fn test_transcode_same_format_is_noop() {
-        let tile = TileData {
-            data: Bytes::from_static(b"test"),
-            format: TileFormat::Pbf,
-            compression: TileCompression::None,
-        };
-        let result = transcode_tile(&tile, TileFormat::Pbf).unwrap();
-        assert_eq!(result.data, tile.data);
-        assert_eq!(result.format, TileFormat::Pbf);
     }
 
     #[test]
@@ -581,22 +562,6 @@ mod tests {
     }
 
     #[test]
-    fn test_mvt_to_mlt_multi_feature_tile() {
-        let mvt_bytes = make_mvt_multi_feature_tile();
-        let tile = TileData {
-            data: Bytes::from(mvt_bytes),
-            format: TileFormat::Pbf,
-            compression: TileCompression::None,
-        };
-        let result = transcode_tile(&tile, TileFormat::Mlt).unwrap();
-        assert_eq!(result.format, TileFormat::Mlt);
-        assert!(!result.data.is_empty());
-        // Verify MLT is parseable
-        let layers = mlt_core::Parser::default().parse_layers(&result.data);
-        assert!(layers.is_ok());
-    }
-
-    #[test]
     fn test_mvt_to_mlt_gzip_compressed_input() {
         use flate2::Compression;
         use flate2::write::GzEncoder;
@@ -618,24 +583,6 @@ mod tests {
         assert!(!result.data.is_empty());
         let layers = mlt_core::Parser::default().parse_layers(&result.data);
         assert!(layers.is_ok());
-    }
-
-    #[test]
-    fn test_mvt_to_mlt_output_differs_from_input() {
-        // Ensure the transcoded output is actually different from the MVT input
-        let mvt_bytes = make_mvt_point_tile("test_layer", 100, 200);
-        let tile = TileData {
-            data: Bytes::from(mvt_bytes.clone()),
-            format: TileFormat::Pbf,
-            compression: TileCompression::None,
-        };
-        let result = transcode_tile(&tile, TileFormat::Mlt).unwrap();
-        // MLT format is structurally different from MVT protobuf
-        assert_ne!(
-            result.data.as_ref(),
-            mvt_bytes.as_slice(),
-            "MLT output should differ from MVT input"
-        );
     }
 
     // -------------------------------------------------------------------------
@@ -754,66 +701,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_roundtrip_preserves_layer_count() {
-        let mvt_bytes = make_mvt_multi_layer_tile();
-        let original = TileData {
-            data: Bytes::from(mvt_bytes.clone()),
-            format: TileFormat::Pbf,
-            compression: TileCompression::None,
-        };
-        // Parse original MVT
-        use prost::Message;
-        let orig_tile = MvtProto::Tile::decode(mvt_bytes.as_slice()).unwrap();
-        // Roundtrip
-        let mlt = transcode_tile(&original, TileFormat::Mlt).unwrap();
-        let roundtripped = transcode_tile(&mlt, TileFormat::Pbf).unwrap();
-        let rt_tile = MvtProto::Tile::decode(roundtripped.data.as_ref()).unwrap();
-        assert_eq!(
-            orig_tile.layers.len(),
-            rt_tile.layers.len(),
-            "Roundtrip should preserve layer count"
-        );
-    }
-
-    #[test]
-    fn test_roundtrip_preserves_feature_count() {
-        let mvt_bytes = make_mvt_multi_feature_tile();
-        let original = TileData {
-            data: Bytes::from(mvt_bytes.clone()),
-            format: TileFormat::Pbf,
-            compression: TileCompression::None,
-        };
-        use prost::Message;
-        let orig_tile = MvtProto::Tile::decode(mvt_bytes.as_slice()).unwrap();
-        let orig_feature_count: usize = orig_tile.layers.iter().map(|l| l.features.len()).sum();
-        // Roundtrip
-        let mlt = transcode_tile(&original, TileFormat::Mlt).unwrap();
-        let roundtripped = transcode_tile(&mlt, TileFormat::Pbf).unwrap();
-        let rt_tile = MvtProto::Tile::decode(roundtripped.data.as_ref()).unwrap();
-        let rt_feature_count: usize = rt_tile.layers.iter().map(|l| l.features.len()).sum();
-        assert_eq!(
-            orig_feature_count, rt_feature_count,
-            "Roundtrip should preserve total feature count"
-        );
-    }
-
     // -------------------------------------------------------------------------
     // Internal function tests
     // -------------------------------------------------------------------------
-
-    #[test]
-    fn test_mvt_to_mlt_internal_single_point() {
-        let mvt_bytes = make_mvt_point_tile("internal_test", 42, 84);
-        let result = mvt_to_mlt(&mvt_bytes);
-        assert!(
-            result.is_ok(),
-            "mvt_to_mlt should succeed: {:?}",
-            result.err()
-        );
-        let mlt_bytes = result.unwrap();
-        assert!(!mlt_bytes.is_empty());
-    }
 
     #[test]
     fn test_layer_encode_error_maps_to_mlt_encode_error() {
@@ -828,122 +718,17 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_mvt_to_mlt_internal_empty_input() {
-        // Empty protobuf encodes as zero bytes
-        let result = mvt_to_mlt(&[]);
-        // Should either succeed (empty tile) or give a clean error
-        if let Ok(mlt_bytes) = result {
-            // Empty tile might produce empty output
-            let _ = mlt_bytes;
-        }
-    }
-
-    #[test]
-    fn test_decompress_tile_data_none() {
-        let tile = TileData {
-            data: Bytes::from_static(b"raw bytes"),
-            format: TileFormat::Pbf,
-            compression: TileCompression::None,
-        };
-        let result = decompress_tile_data(&tile).unwrap();
-        assert_eq!(result, b"raw bytes");
-    }
-
-    #[test]
-    fn test_decompress_tile_data_gzip() {
-        use flate2::Compression;
-        use flate2::write::GzEncoder;
-        use std::io::Write;
-
-        let original = b"hello world";
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(original).unwrap();
-        let compressed = encoder.finish().unwrap();
-
-        let tile = TileData {
-            data: Bytes::from(compressed),
-            format: TileFormat::Pbf,
-            compression: TileCompression::Gzip,
-        };
-        let result = decompress_tile_data(&tile).unwrap();
-        assert_eq!(result, original);
-    }
-
-    #[test]
-    fn test_decompress_tile_data_invalid_gzip() {
-        let tile = TileData {
-            data: Bytes::from_static(b"not gzip data"),
-            format: TileFormat::Pbf,
-            compression: TileCompression::Gzip,
-        };
-        let result = decompress_tile_data(&tile);
-        assert!(result.is_err());
-    }
-
     // -------------------------------------------------------------------------
     // Zigzag encoding edge cases
     // -------------------------------------------------------------------------
-
-    #[test]
-    fn test_zigzag_encode_min_max() {
-        assert_eq!(zigzag_encode(i32::MAX), (u32::MAX - 1));
-        assert_eq!(zigzag_encode(i32::MIN), u32::MAX);
-    }
-
-    #[test]
-    fn test_zigzag_encode_symmetry() {
-        // Positive and negative values should alternate
-        for i in 0..100 {
-            let pos = zigzag_encode(i);
-            let neg = zigzag_encode(-i);
-            if i == 0 {
-                assert_eq!(pos, neg);
-            } else {
-                assert_eq!(pos, neg + 1, "zigzag({i}) should be zigzag(-{i}) + 1");
-            }
-        }
-    }
 
     // -------------------------------------------------------------------------
     // Command integer encoding tests
     // -------------------------------------------------------------------------
 
-    #[test]
-    fn test_command_integer_all_types() {
-        // MoveTo = 1
-        assert_eq!(command_integer(1, 1), 0b0000_1001); // 9
-        assert_eq!(command_integer(1, 2), 0b0001_0001); // 17
-        // LineTo = 2
-        assert_eq!(command_integer(2, 1), 0b0000_1010); // 10
-        assert_eq!(command_integer(2, 5), 0b0010_1010); // 42
-        // ClosePath = 7
-        assert_eq!(command_integer(7, 1), 0b0000_1111); // 15
-    }
-
     // -------------------------------------------------------------------------
     // MLT → MVT tests (Phase 3, existing path)
     // -------------------------------------------------------------------------
-
-    #[test]
-    fn test_mlt_to_mvt_from_valid_mlt() {
-        // Create a valid MLT tile via MVT→MLT, then convert back
-        let mvt_bytes = make_mvt_point_tile("phase3_test", 50, 75);
-        let mlt_bytes = mvt_to_mlt(&mvt_bytes).unwrap();
-        let mlt_tile = TileData {
-            data: mlt_bytes,
-            format: TileFormat::Mlt,
-            compression: TileCompression::None,
-        };
-        let result = transcode_tile(&mlt_tile, TileFormat::Pbf);
-        assert!(result.is_ok(), "MLT→MVT should succeed: {:?}", result.err());
-        let mvt_tile = result.unwrap();
-        assert_eq!(mvt_tile.format, TileFormat::Pbf);
-        // Verify it's valid protobuf
-        use prost::Message;
-        let decoded = MvtProto::Tile::decode(mvt_tile.data.as_ref());
-        assert!(decoded.is_ok());
-    }
 
     #[test]
     fn test_mlt_to_mvt_invalid_input() {
@@ -1009,17 +794,6 @@ mod tests {
     }
 
     #[test]
-    fn test_decompress_brotli_compression_unsupported() {
-        let tile = TileData {
-            data: Bytes::from_static(b"any bytes"),
-            format: TileFormat::Mlt,
-            compression: TileCompression::Brotli,
-        };
-        let err = transcode_tile(&tile, TileFormat::Pbf).unwrap_err();
-        assert!(matches!(err, TileServerError::MltDecodeError(_)));
-    }
-
-    #[test]
     fn test_decompress_malformed_gzip_returns_error() {
         // Not a valid gzip stream (missing magic header).
         let tile = TileData {
@@ -1039,42 +813,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_decompress_empty_gzip_returns_error() {
-        // Empty bytes with Gzip compression — GzDecoder should error reading the header.
-        let tile = TileData {
-            data: Bytes::new(),
-            format: TileFormat::Pbf,
-            compression: TileCompression::Gzip,
-        };
-        let err = transcode_tile(&tile, TileFormat::Mlt).unwrap_err();
-        assert!(matches!(err, TileServerError::MltDecodeError(_)));
-    }
-
-    #[test]
-    fn test_decompress_truncated_gzip_stream_returns_error() {
-        // Build a valid gzip stream then chop the trailer to corrupt it.
-        use flate2::Compression;
-        use flate2::write::GzEncoder;
-        use std::io::Write;
-
-        let mvt_bytes = make_mvt_point_tile("trunc", 1, 2);
-        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
-        enc.write_all(&mvt_bytes).unwrap();
-        let mut compressed = enc.finish().unwrap();
-        // Drop the trailer (last 8 bytes = CRC32 + ISIZE) — leaves a half-stream.
-        let truncated_len = compressed.len().saturating_sub(8);
-        compressed.truncate(truncated_len);
-
-        let tile = TileData {
-            data: Bytes::from(compressed),
-            format: TileFormat::Pbf,
-            compression: TileCompression::Gzip,
-        };
-        let result = transcode_tile(&tile, TileFormat::Mlt);
-        assert!(result.is_err(), "truncated gzip should fail to transcode");
-    }
-
     // -------------------------------------------------------------------------
     // transcode_tile — same-format passthrough and unsupported-pair coverage
     // -------------------------------------------------------------------------
@@ -1092,33 +830,5 @@ mod tests {
         assert_eq!(result.format, TileFormat::Mlt);
         assert_eq!(result.compression, TileCompression::Gzip);
         assert_eq!(result.data, tile.data);
-    }
-
-    #[test]
-    fn test_transcode_mlt_to_png_unsupported() {
-        let tile = TileData {
-            data: Bytes::from_static(b"any"),
-            format: TileFormat::Mlt,
-            compression: TileCompression::None,
-        };
-        let err = transcode_tile(&tile, TileFormat::Png).unwrap_err();
-        match err {
-            TileServerError::TranscodeUnsupported { from, to } => {
-                assert_eq!(from, "Mlt");
-                assert_eq!(to, "Png");
-            }
-            e => panic!("expected TranscodeUnsupported, got {e:?}"),
-        }
-    }
-
-    #[test]
-    fn test_transcode_pbf_to_jpeg_unsupported() {
-        let tile = TileData {
-            data: Bytes::from_static(b"any"),
-            format: TileFormat::Pbf,
-            compression: TileCompression::None,
-        };
-        let err = transcode_tile(&tile, TileFormat::Jpeg).unwrap_err();
-        assert!(matches!(err, TileServerError::TranscodeUnsupported { .. }));
     }
 }

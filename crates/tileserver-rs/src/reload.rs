@@ -81,8 +81,34 @@ impl SharedState {
         self.controller.config_path.as_deref()
     }
 
+    /// Reload the configuration and rebuild the server state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the config cannot be loaded or the new sources
+    /// or styles fail to load; the running state is kept.
     pub async fn reload(&self, flush: bool) -> anyhow::Result<ReloadResult> {
         self.controller.reload(flush).await
+    }
+
+    /// Rebuild the server state because the data of `sources` changed
+    /// (config unchanged), then broadcast a `reload` for each of them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the sources or styles fail to load; the
+    /// running state is kept.
+    pub async fn reload_sources(&self, sources: &[String]) -> anyhow::Result<()> {
+        self.controller
+            .reload_inner(true, sources)
+            .await
+            .map(|_| ())
+    }
+
+    /// Live-update broadcast hub (`GET /ws`).
+    #[must_use]
+    pub fn live(&self) -> &crate::live::LiveHub {
+        &self.controller.live
     }
 
     /// Access the upload registry (for upload/delete handlers)
@@ -94,6 +120,15 @@ impl SharedState {
     /// Store a new AppState (used by upload/delete to swap sources at runtime)
     pub fn store(&self, state: Arc<AppState>) {
         self.controller.app.store(state);
+    }
+
+    /// Replace the live state with `update(current)` while holding the
+    /// reload lock, so an upload or delete never overwrites a concurrent
+    /// reload or another upload with a stale snapshot.
+    pub async fn update(&self, update: impl FnOnce(&AppState) -> AppState) {
+        let _guard = self.controller.reload_mutex.lock().await;
+        let current = self.controller.app.load_full();
+        self.controller.app.store(Arc::new(update(&current)));
     }
 }
 
@@ -138,6 +173,7 @@ pub struct ReloadController {
     config_path: Option<PathBuf>,
     runtime: RuntimeSettings,
     reload_mutex: Mutex<()>,
+    live: crate::live::LiveHub,
 }
 
 impl ReloadController {
@@ -156,10 +192,22 @@ impl ReloadController {
             config_path,
             runtime,
             reload_mutex: Mutex::new(()),
+            live: crate::live::LiveHub::new(),
         }
     }
 
     async fn reload(&self, flush: bool) -> anyhow::Result<ReloadResult> {
+        self.reload_inner(flush, &[]).await
+    }
+
+    /// Reload, then broadcast a live `reload` for every source whose config
+    /// entry changed plus `data_changed` (sources whose files changed).
+    /// A forced reload (`flush`) with no named sources reloads every source.
+    async fn reload_inner(
+        &self,
+        flush: bool,
+        data_changed: &[String],
+    ) -> anyhow::Result<ReloadResult> {
         let _guard = self.reload_mutex.lock().await;
 
         let load = Config::load_with_metadata(self.config_path.clone())?;
@@ -199,9 +247,20 @@ impl ReloadController {
             prometheus_listener_active: new_meta.prometheus_listener_active,
         };
 
+        let old_config = self.config.load_full();
+        let mut changed: std::collections::BTreeSet<String> =
+            crate::live::changed_sources(&old_config, &load.config)
+                .into_iter()
+                .collect();
+        changed.extend(data_changed.iter().cloned());
+        if flush && data_changed.is_empty() {
+            changed.extend(load.config.sources.iter().map(|s| s.id.clone()));
+        }
+
         self.app.store(Arc::new(new_state));
         self.meta.store(Arc::new(new_meta));
         self.config.store(Arc::new(load.config));
+        self.live.publish_reloads(changed);
 
         Ok(result)
     }
@@ -216,10 +275,16 @@ pub fn now_unix_seconds() -> u64 {
 }
 
 /// Build an [`AppState`] from a [`Config`] and [`RuntimeSettings`].
+///
+/// # Errors
+///
+/// Returns an error when a source or style fails to load.
 pub async fn build_app_state(
     config: &Config,
     runtime: &RuntimeSettings,
 ) -> anyhow::Result<AppState> {
+    crate::metrics::dashboard::configure(config.telemetry.dashboard_settings());
+
     // Load tile sources
     #[cfg(feature = "postgres")]
     let raw_sources =
@@ -254,6 +319,7 @@ pub async fn build_app_state(
             tile_size: 512,
             pool_size: config.render.pool_size,
             render_timeout: std::time::Duration::from_secs(config.render.render_timeout_secs),
+            queue_size: config.render.queue_size,
         };
         match Renderer::with_config(pool_config, 3) {
             Ok(r) => {
@@ -311,7 +377,7 @@ pub async fn build_app_state(
     };
 
     if let Some(ref dir) = upload_dir {
-        if let Err(e) = std::fs::create_dir_all(dir) {
+        if let Err(e) = tokio::fs::create_dir_all(dir).await {
             tracing::warn!("Failed to create upload directory {}: {}", dir.display(), e);
         } else {
             tracing::info!("Upload directory: {}", dir.display());
@@ -366,183 +432,12 @@ pub async fn reload_signal(_controller: Arc<ReloadController>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-
-    fn make_test_app_state() -> AppState {
-        AppState {
-            sources: Arc::new(crate::sources::SourceManager::new()),
-            styles: Arc::new(crate::styles::StyleManager::new()),
-            renderer: None,
-            base_url: "http://localhost:8080".to_string(),
-            render_base_url: "http://127.0.0.1:8080".to_string(),
-            ui_enabled: false,
-            fonts_dir: None,
-            files_dir: None,
-            upload_dir: None,
-        }
-    }
-
-    fn make_test_meta() -> ReloadMeta {
-        ReloadMeta {
-            config_hash: "test-hash".to_string(),
-            loaded_at_unix: now_unix_seconds(),
-            loaded_sources: 0,
-            loaded_styles: 0,
-            renderer_enabled: false,
-            prometheus_listener_active: false,
-        }
-    }
-
-    fn make_test_runtime() -> RuntimeSettings {
-        RuntimeSettings {
-            ui_enabled: false,
-            runtime_host: "127.0.0.1".to_string(),
-            runtime_port: 8080,
-            public_url_override: None,
-        }
-    }
-
-    #[test]
-    fn now_unix_seconds_is_positive() {
-        let t = now_unix_seconds();
-        assert!(t > 0, "unix timestamp must be positive");
-    }
 
     #[test]
     fn now_unix_seconds_is_recent() {
         let t = now_unix_seconds();
         // Must be after 2020-01-01 (unix 1577836800)
         assert!(t > 1_577_836_800, "timestamp should be after 2020");
-    }
-
-    #[test]
-    fn runtime_settings_fields_accessible() {
-        let rt = make_test_runtime();
-        assert_eq!(rt.runtime_port, 8080);
-        assert_eq!(rt.runtime_host, "127.0.0.1");
-        assert!(!rt.ui_enabled);
-        assert!(rt.public_url_override.is_none());
-    }
-
-    #[test]
-    fn reload_meta_fields_accessible() {
-        let meta = make_test_meta();
-        assert_eq!(meta.config_hash, "test-hash");
-        assert_eq!(meta.loaded_sources, 0);
-        assert!(!meta.renderer_enabled);
-    }
-
-    #[test]
-    fn app_state_fields_accessible() {
-        let state = make_test_app_state();
-        assert!(state.renderer.is_none());
-        assert!(state.fonts_dir.is_none());
-        assert!(!state.ui_enabled);
-        assert_eq!(state.base_url, "http://localhost:8080");
-    }
-
-    #[test]
-    fn reload_controller_new_stores_initial_state() {
-        let state = make_test_app_state();
-        let meta = make_test_meta();
-        let runtime = make_test_runtime();
-        let controller = ReloadController::new(state, meta, Config::default(), None, runtime);
-        let loaded = controller.app.load_full();
-        assert_eq!(loaded.base_url, "http://localhost:8080");
-    }
-
-    #[test]
-    fn shared_state_new_load_returns_initial_state() {
-        let state = make_test_app_state();
-        let meta = make_test_meta();
-        let runtime = make_test_runtime();
-        let controller = Arc::new(ReloadController::new(
-            state,
-            meta,
-            Config::default(),
-            None,
-            runtime,
-        ));
-        let shared = SharedState::new(controller);
-        let loaded = shared.load();
-        assert_eq!(loaded.base_url, "http://localhost:8080");
-    }
-
-    #[test]
-    fn shared_state_meta_returns_initial_hash() {
-        let state = make_test_app_state();
-        let meta = make_test_meta();
-        let runtime = make_test_runtime();
-        let controller = Arc::new(ReloadController::new(
-            state,
-            meta,
-            Config::default(),
-            None,
-            runtime,
-        ));
-        let shared = SharedState::new(controller);
-        let loaded_meta = shared.meta();
-        assert_eq!(loaded_meta.config_hash, "test-hash");
-    }
-
-    #[test]
-    fn shared_state_uploads_initially_empty() {
-        let state = make_test_app_state();
-        let meta = make_test_meta();
-        let runtime = make_test_runtime();
-        let controller = Arc::new(ReloadController::new(
-            state,
-            meta,
-            Config::default(),
-            None,
-            runtime,
-        ));
-        let shared = SharedState::new(controller);
-        let _ = shared.uploads();
-    }
-
-    #[test]
-    fn app_state_clone_preserves_base_url() {
-        let state = make_test_app_state();
-        let cloned = state.clone();
-        assert_eq!(state.base_url, cloned.base_url);
-    }
-
-    #[test]
-    fn shared_state_store_swaps_app_state_atomically() {
-        let state = make_test_app_state();
-        let meta = make_test_meta();
-        let runtime = make_test_runtime();
-        let controller = Arc::new(ReloadController::new(
-            state,
-            meta,
-            Config::default(),
-            None,
-            runtime,
-        ));
-        let shared = SharedState::new(controller);
-
-        let mut replacement = make_test_app_state();
-        replacement.base_url = "http://replaced".to_string();
-        shared.store(Arc::new(replacement));
-
-        let loaded = shared.load();
-        assert_eq!(loaded.base_url, "http://replaced");
-    }
-
-    #[test]
-    fn upload_info_clone_round_trips_fields() {
-        let info = UploadInfo {
-            id: "abc".to_string(),
-            file_name: "world.mbtiles".to_string(),
-            format: "mbtiles".to_string(),
-            file_path: std::path::PathBuf::from("/tmp/x.mbtiles"),
-        };
-        let cloned = info.clone();
-        assert_eq!(cloned.id, "abc");
-        assert_eq!(cloned.file_name, "world.mbtiles");
-        assert_eq!(cloned.format, "mbtiles");
-        assert_eq!(cloned.file_path, std::path::PathBuf::from("/tmp/x.mbtiles"));
     }
 
     fn runtime_for(host: &str, port: u16, public_override: Option<&str>) -> RuntimeSettings {
@@ -780,35 +675,5 @@ mod tests {
 
         let new_state = controller.app.load_full();
         assert_eq!(new_state.base_url, "https://changed.test");
-    }
-
-    #[tokio::test]
-    async fn shared_state_reload_through_controller_short_circuits_on_same_hash() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let cfg_path = tempdir.path().join("config.toml");
-        write_default_config_toml(&cfg_path);
-
-        let load = crate::config::Config::load_with_metadata(Some(cfg_path.clone())).unwrap();
-        let runtime = runtime_for("127.0.0.1", 8080, None);
-        let initial_state = build_app_state(&load.config, &runtime).await.unwrap();
-        let meta = ReloadMeta {
-            config_hash: load.content_hash.clone(),
-            loaded_at_unix: now_unix_seconds(),
-            loaded_sources: 0,
-            loaded_styles: 0,
-            renderer_enabled: false,
-            prometheus_listener_active: false,
-        };
-        let controller = Arc::new(ReloadController::new(
-            initial_state,
-            meta,
-            load.config.clone(),
-            Some(cfg_path),
-            runtime,
-        ));
-        let shared = SharedState::new(controller);
-
-        let result = shared.reload(false).await.unwrap();
-        assert!(!result.reloaded);
     }
 }

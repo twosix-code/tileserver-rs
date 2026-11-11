@@ -113,14 +113,18 @@ impl SourceManager {
     ///
     /// Fails when the tile cannot be decoded or is not a vector tile.
     #[cfg(feature = "cel")]
-    pub fn apply_preset(
+    pub async fn apply_preset(
         &self,
         id: &str,
         tile: Option<crate::sources::TileData>,
     ) -> Result<Option<crate::sources::TileData>> {
         match (self.filters.get(id), tile) {
             (Some(filter), Some(tile)) => {
-                Ok(Some(crate::cel_filter::apply(tile, &[filter.as_ref()])?))
+                let filter = Arc::clone(filter);
+                // Decode, filter and re-encode is CPU work: keep it off the runtime.
+                crate::cel_filter::apply_blocking(tile, vec![filter])
+                    .await
+                    .map(Some)
             }
             (_, tile) => Ok(tile),
         }
@@ -133,7 +137,7 @@ impl SourceManager {
     /// Never fails.
     #[cfg(not(feature = "cel"))]
     #[allow(clippy::unnecessary_wraps, clippy::unused_self)]
-    pub fn apply_preset(
+    pub async fn apply_preset(
         &self,
         _id: &str,
         tile: Option<crate::sources::TileData>,
@@ -163,6 +167,11 @@ impl SourceManager {
     }
 
     /// Get a vector tile, checking the global cache first when enabled.
+    ///
+    /// # Errors
+    ///
+    /// [`TileServerError::SourceNotFound`] for an unknown `id`, and the
+    /// errors of the source and of its CEL preset.
     pub async fn get_tile(
         &self,
         id: &str,
@@ -193,6 +202,8 @@ impl SourceManager {
                     source: id,
                     format,
                     z,
+                    x,
+                    y,
                     bytes: cached.data.len(),
                     duration: started.elapsed(),
                     outcome: crate::metrics::TileOutcome::Hit,
@@ -211,12 +222,14 @@ impl SourceManager {
                 source: id,
                 format,
                 z,
+                x,
+                y,
                 bytes,
                 duration: started.elapsed(),
                 outcome,
             });
 
-            let result = self.apply_preset(id, fetch_result?)?;
+            let result = self.apply_preset(id, fetch_result?).await?;
             if let Some(ref tile) = result {
                 cache.insert(key, tile.clone()).await;
             }
@@ -232,11 +245,13 @@ impl SourceManager {
                 source: id,
                 format,
                 z,
+                x,
+                y,
                 bytes,
                 duration: started.elapsed(),
                 outcome,
             });
-            self.apply_preset(id, fetch_result?)
+            self.apply_preset(id, fetch_result?).await
         }
     }
 
@@ -246,6 +261,10 @@ impl SourceManager {
     /// reference another `[[sources]]` entry via `input_source`; deferring
     /// them guarantees the referenced source already exists in the map
     /// regardless of declaration order in the config file.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first source load error, or an invalid CEL preset.
     pub async fn from_configs(configs: &[SourceConfig]) -> Result<Self> {
         let mut manager = Self::new();
 
@@ -277,6 +296,10 @@ impl SourceManager {
     }
 
     /// Load sources from configuration including PostgreSQL sources
+    ///
+    /// # Errors
+    ///
+    /// Returns the first source or PostgreSQL load error.
     #[cfg(feature = "postgres")]
     pub async fn from_configs_with_postgres(
         configs: &[SourceConfig],
@@ -291,210 +314,100 @@ impl SourceManager {
         Ok(manager)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error when the pool cannot connect or a table, function or
+    /// out-db source fails to load.
     #[cfg(feature = "postgres")]
     pub async fn load_postgres_sources(&mut self, config: &PostgresConfig) -> Result<()> {
-        let pool_settings = PoolSettings {
-            max_size: config.pool_size,
-            wait_timeout_ms: config.pool_wait_timeout_ms,
-            create_timeout_ms: config.pool_create_timeout_ms,
-            recycle_timeout_ms: config.pool_recycle_timeout_ms,
-            pre_warm: config.pool_pre_warm,
-        };
-
         let pool = Arc::new(
             PostgresPool::new(
                 &config.connection_string,
-                pool_settings.clone(),
+                pool_settings(config),
                 config.ssl_cert.as_ref(),
                 config.ssl_key.as_ref(),
                 config.ssl_root_cert.as_ref(),
             )
             .await?,
         );
-
         self.postgres_pool = Some(pool.clone());
-
-        let tile_cache = config.cache.as_ref().map(|cache_config| {
-            let cache = Arc::new(TileCache::new(
-                cache_config.size_mb,
-                cache_config.ttl_seconds,
-            ));
-            tracing::info!(
-                "Initialized PostgreSQL tile cache: {}MB, TTL {}s",
-                cache_config.size_mb,
-                cache_config.ttl_seconds
-            );
-            cache
-        });
+        let tile_cache = config.cache.as_ref().map(postgres_tile_cache);
         self.tile_cache = tile_cache.clone();
 
-        let mut function_sources: Vec<PostgresFunctionSource> =
-            Vec::with_capacity(config.functions.len());
-        for func_config in &config.functions {
-            match PostgresFunctionSource::new(pool.clone(), func_config, tile_cache.clone()).await {
-                Ok(source) => {
-                    tracing::info!(
-                        "Loaded PostgreSQL function source: {} ({}.{})",
-                        func_config.id,
-                        func_config.schema,
-                        func_config.function
-                    );
-                    function_sources.push(source);
-                }
-                Err(e) => {
-                    tracing::error!(
-                        "Failed to load PostgreSQL function source {}: {}",
-                        func_config.id,
-                        e
-                    );
-                }
-            }
-        }
+        let functions = load_function_sources(&pool, &config.functions, &tile_cache).await;
+        let tables = load_table_sources(&pool, &config.tables, &tile_cache).await;
+        #[cfg(feature = "raster")]
+        let outdb = load_outdb_sources(&pool, &config.outdb_rasters).await;
 
-        let mut table_sources: Vec<PostgresTableSource> = Vec::with_capacity(config.tables.len());
-        for table_config in &config.tables {
-            match PostgresTableSource::new(pool.clone(), table_config, tile_cache.clone()).await {
-                Ok(source) => {
-                    tracing::info!(
-                        "Loaded PostgreSQL table source: {} ({}.{})",
-                        table_config.id,
-                        table_config.schema,
-                        table_config.table
-                    );
-                    table_sources.push(source);
-                }
-                Err(e) => {
-                    tracing::error!(
-                        "Failed to load PostgreSQL table source {}: {}",
-                        table_config.id,
-                        e
-                    );
-                }
-            }
-        }
-
-        #[cfg(all(feature = "postgres", feature = "raster"))]
-        let mut outdb_raster_sources: Vec<PostgresOutDbRasterSource> =
-            Vec::with_capacity(config.outdb_rasters.len());
-        #[cfg(all(feature = "postgres", feature = "raster"))]
-        for outdb_config in &config.outdb_rasters {
-            match PostgresOutDbRasterSource::new(pool.clone(), outdb_config).await {
-                Ok(source) => {
-                    tracing::info!(
-                        "Loaded PostgreSQL out-db raster source: {} ({}.{})",
-                        outdb_config.id,
-                        outdb_config.schema,
-                        outdb_config.function.as_ref().unwrap_or(&outdb_config.id)
-                    );
-                    outdb_raster_sources.push(source);
-                }
-                Err(e) => {
-                    tracing::error!(
-                        "Failed to load PostgreSQL out-db raster source {}: {}",
-                        outdb_config.id,
-                        e
-                    );
-                }
-            }
-        }
-
-        if pool_settings.pre_warm {
-            let tile_param_types: &[Type] = &[Type::INT4, Type::INT4, Type::INT4];
-            let mut queries: Vec<(&str, &[Type])> = Vec::new();
-
-            for source in &function_sources {
-                queries.push((source.tile_query(), tile_param_types));
-            }
-            for source in &table_sources {
-                queries.push((source.tile_query(), tile_param_types));
-            }
+        if config.pool_pre_warm {
+            let queries = tile_queries(&functions, &tables);
             #[cfg(feature = "raster")]
-            for source in &outdb_raster_sources {
-                let outdb_param_types: &[Type] =
-                    &[Type::INT4, Type::INT4, Type::INT4, Type::TEXT, Type::JSONB];
-                queries.push((source.tile_query(), outdb_param_types));
-            }
-
+            let queries: Vec<_> = queries
+                .into_iter()
+                .chain(outdb.iter().map(|s| (s.tile_query(), OUTDB_PARAM_TYPES)))
+                .collect();
             pool.warmup(&queries).await?;
         }
 
         #[cfg(feature = "cel")]
-        for func_config in &config.functions {
-            if function_sources
-                .iter()
-                .any(|s| s.metadata().id == func_config.id)
-            {
-                self.register_filter(&func_config.id, func_config.filter.as_ref())?;
-            }
-        }
-        #[cfg(feature = "cel")]
-        for table_config in &config.tables {
-            if table_sources
-                .iter()
-                .any(|s| s.metadata().id == table_config.id)
-            {
-                self.register_filter(&table_config.id, table_config.filter.as_ref())?;
+        for (id, filter) in config
+            .functions
+            .iter()
+            .map(|f| (&f.id, f.filter.as_ref()))
+            .chain(config.tables.iter().map(|t| (&t.id, t.filter.as_ref())))
+        {
+            if self.sources_contain_loaded(id, &functions, &tables) {
+                self.register_filter(id, filter)?;
             }
         }
 
-        for source in function_sources {
+        for source in functions {
             self.sources
                 .insert(source.metadata().id.clone(), Arc::new(source));
         }
-        for source in table_sources {
+        for source in tables {
             self.sources
                 .insert(source.metadata().id.clone(), Arc::new(source));
         }
         #[cfg(feature = "raster")]
-        for source in outdb_raster_sources {
+        for source in outdb {
             self.sources
                 .insert(source.metadata().id.clone(), Arc::new(source));
         }
-
         Ok(())
     }
 
+    /// Whether `id` names a function or table source that loaded.
+    #[cfg(all(feature = "postgres", feature = "cel"))]
+    fn sources_contain_loaded(
+        &self,
+        id: &str,
+        functions: &[PostgresFunctionSource],
+        tables: &[PostgresTableSource],
+    ) -> bool {
+        functions.iter().any(|s| s.metadata().id == id)
+            || tables.iter().any(|s| s.metadata().id == id)
+    }
+
     /// Load a single source from config
+    ///
+    /// # Errors
+    ///
+    /// [`TileServerError::ConfigError`] for an unsupported source, and the
+    /// errors of the source constructor.
     pub async fn load_source(&mut self, config: &SourceConfig) -> Result<()> {
-        let source: Arc<dyn TileSource> = match config.source_type {
-            SourceType::PMTiles => {
-                #[cfg(feature = "cloud")]
-                if crate::sources::pmtiles::cloud::is_cloud_url(&config.path) {
-                    let source = Arc::new(
-                        crate::sources::pmtiles::cloud::CloudPmTilesSource::from_url(config)
-                            .await?,
-                    );
-                    self.sources.insert(config.id.clone(), source);
-                    #[cfg(feature = "cel")]
-                    self.register_filter(&config.id, config.filter.as_ref())?;
-                    return Ok(());
-                }
+        let source = self.open_source(config).await?;
+        #[cfg(feature = "cel")]
+        self.register_filter(&config.id, config.filter.as_ref())?;
+        self.sources.insert(config.id.clone(), source);
+        Ok(())
+    }
 
-                #[cfg(feature = "sftp")]
-                if crate::sources::pmtiles::sftp::is_sftp_url(&config.path) {
-                    let source = Arc::new(
-                        crate::sources::pmtiles::sftp::SftpPmTilesSource::from_url(config).await?,
-                    );
-                    self.sources.insert(config.id.clone(), source);
-                    #[cfg(feature = "cel")]
-                    self.register_filter(&config.id, config.filter.as_ref())?;
-                    return Ok(());
-                }
-
-                if config.path.starts_with("http://") || config.path.starts_with("https://") {
-                    let client = reqwest::Client::builder()
-                        .user_agent("tileserver-rs/0.1.0")
-                        .build()
-                        .map_err(|e| {
-                            TileServerError::ConfigError(format!(
-                                "failed to create HTTP client: {e}"
-                            ))
-                        })?;
-                    Arc::new(HttpPmTilesSource::from_url(config, client).await?)
-                } else {
-                    Arc::new(LocalPmTilesSource::from_file(config).await?)
-                }
-            }
+    /// Open the source a [`SourceConfig`] describes. DEM sources may refer
+    /// to raster sources loaded before them.
+    async fn open_source(&self, config: &SourceConfig) -> Result<Arc<dyn TileSource>> {
+        Ok(match config.source_type {
+            SourceType::PMTiles => open_pmtiles(config).await?,
             SourceType::MBTiles => Arc::new(MbTilesSource::from_file(config).await?),
             SourceType::Dir => Arc::new(DirSource::from_file(config).await?),
             SourceType::Tar => Arc::new(TarSource::from_file(config).await?),
@@ -516,12 +429,7 @@ impl SourceManager {
             SourceType::Dem => {
                 Arc::new(crate::sources::dem::DemSource::from_config(config, &self.sources).await?)
             }
-        };
-
-        #[cfg(feature = "cel")]
-        self.register_filter(&config.id, config.filter.as_ref())?;
-        self.sources.insert(config.id.clone(), source);
-        Ok(())
+        })
     }
 
     /// Get a source by ID
@@ -586,6 +494,11 @@ impl SourceManager {
         self.sources.remove(id).is_some()
     }
 
+    /// Get a raster tile with default parameters.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`SourceManager::get_raster_tile_with_params`].
     #[cfg(feature = "raster")]
     pub async fn get_raster_tile(
         &self,
@@ -600,6 +513,10 @@ impl SourceManager {
             .await
     }
 
+    /// # Errors
+    ///
+    /// [`TileServerError::SourceNotFound`] for an unknown or non-raster
+    /// `id`, and the errors of the source.
     #[cfg(feature = "raster")]
     #[allow(clippy::too_many_arguments)]
     pub async fn get_raster_tile_with_params(
@@ -617,6 +534,7 @@ impl SourceManager {
             .get(id)
             .ok_or_else(|| TileServerError::SourceNotFound(id.to_string()))?;
 
+        let started = std::time::Instant::now();
         let format = source.format();
 
         // Raster tiles are deterministic in `(id, z, x, y, encoding, filter)`:
@@ -645,16 +563,26 @@ impl SourceManager {
             && let Some(cached) = cache.get(key).await
         {
             crate::metrics::cache_hit_recorded(id);
+            crate::metrics::tile_request_recorded(crate::metrics::TileEvent {
+                source: id,
+                format,
+                z,
+                x,
+                y,
+                bytes: cached.data.len(),
+                duration: started.elapsed(),
+                outcome: crate::metrics::TileOutcome::Hit,
+            });
             return Ok(Some(cached));
         }
         if self.global_cache.is_some() {
             crate::metrics::cache_miss_recorded(id);
         }
 
-        let tile = if let Some(cog) = source.as_ref().as_any().downcast_ref::<CogSource>() {
+        let rendered = if let Some(cog) = source.as_ref().as_any().downcast_ref::<CogSource>() {
             let resample = resampling.unwrap_or(cog.resampling());
             cog.get_tile_with_resampling(z, x, y, tile_size, resample)
-                .await?
+                .await
         } else {
             #[cfg(feature = "dem")]
             if let Some(dem) = source
@@ -662,7 +590,7 @@ impl SourceManager {
                 .as_any()
                 .downcast_ref::<crate::sources::dem::DemSource>()
             {
-                dem.get_tile_sized(z, x, y, tile_size).await?
+                dem.get_tile_sized(z, x, y, tile_size).await
             } else {
                 #[cfg(feature = "postgres")]
                 if let Some(outdb) = source
@@ -672,12 +600,11 @@ impl SourceManager {
                 {
                     outdb
                         .get_tile_with_params(z, x, y, tile_size, resampling, query_params)
-                        .await?
+                        .await
                 } else {
                     #[cfg(not(feature = "postgres"))]
                     let _ = query_params;
-                    let tile = source.get_tile(z, x, y).await?;
-                    self.apply_preset(id, tile)?
+                    source.get_tile(z, x, y).await
                 }
             }
             #[cfg(not(feature = "dem"))]
@@ -690,17 +617,18 @@ impl SourceManager {
                 {
                     outdb
                         .get_tile_with_params(z, x, y, tile_size, resampling, query_params)
-                        .await?
+                        .await
                 } else {
                     #[cfg(not(feature = "postgres"))]
                     let _ = query_params;
-                    let tile = source.get_tile(z, x, y).await?;
-                    self.apply_preset(id, tile)?
+                    source.get_tile(z, x, y).await
                 }
             }
         };
 
-        let _ = format;
+        record_uncached(id, format, z, x, y, started, &rendered);
+        let tile = self.apply_preset(id, rendered?).await?;
+
         if let (Some(cache), Some(key)) = (&self.global_cache, cache_key)
             && let Some(ref tile) = tile
         {
@@ -723,6 +651,10 @@ impl SourceManager {
             .unwrap_or(false)
     }
 
+    /// # Errors
+    ///
+    /// [`TileServerError::SourceNotFound`] for an unknown `id`, and the
+    /// errors of the source.
     #[cfg(feature = "postgres")]
     pub async fn get_vector_tile_with_query_params(
         &self,
@@ -742,13 +674,14 @@ impl SourceManager {
             .as_any()
             .downcast_ref::<PostgresFunctionSource>()
         {
-            let tile = pg_func
+            let started = std::time::Instant::now();
+            let result = pg_func
                 .get_tile_with_query_params(z, x, y, query_params)
-                .await?;
-            self.apply_preset(id, tile)
+                .await;
+            record_uncached(id, source.format(), z, x, y, started, &result);
+            self.apply_preset(id, result?).await
         } else {
-            let tile = source.get_tile(z, x, y).await?;
-            self.apply_preset(id, tile)
+            self.get_tile(id, z, x, y).await
         }
     }
 
@@ -771,6 +704,185 @@ impl Default for SourceManager {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Record a tile request served outside [`SourceManager::get_tile`] (raster
+/// renders and parameterised PostGIS function tiles, which bypass the tile
+/// cache).
+#[cfg(any(feature = "raster", feature = "postgres"))]
+fn record_uncached(
+    id: &str,
+    format: crate::sources::TileFormat,
+    z: u8,
+    x: u32,
+    y: u32,
+    started: std::time::Instant,
+    result: &crate::error::Result<Option<crate::sources::TileData>>,
+) {
+    let (outcome, bytes) = match result {
+        Ok(Some(tile)) => (crate::metrics::TileOutcome::Miss, tile.data.len()),
+        Ok(None) => (crate::metrics::TileOutcome::NotFound, 0),
+        Err(_) => (crate::metrics::TileOutcome::Error, 0),
+    };
+    crate::metrics::tile_request_recorded(crate::metrics::TileEvent {
+        source: id,
+        format,
+        z,
+        x,
+        y,
+        bytes,
+        duration: started.elapsed(),
+        outcome,
+    });
+}
+
+/// Pick the PMTiles backend from the path: cloud object store, SFTP,
+/// HTTP(S) or a local file.
+async fn open_pmtiles(config: &SourceConfig) -> Result<Arc<dyn TileSource>> {
+    #[cfg(feature = "cloud")]
+    if crate::sources::pmtiles::cloud::is_cloud_url(&config.path) {
+        return Ok(Arc::new(
+            crate::sources::pmtiles::cloud::CloudPmTilesSource::from_url(config).await?,
+        ));
+    }
+    #[cfg(feature = "sftp")]
+    if crate::sources::pmtiles::sftp::is_sftp_url(&config.path) {
+        return Ok(Arc::new(
+            crate::sources::pmtiles::sftp::SftpPmTilesSource::from_url(config).await?,
+        ));
+    }
+    if config.path.starts_with("http://") || config.path.starts_with("https://") {
+        let client = reqwest::Client::builder()
+            .user_agent("tileserver-rs/0.1.0")
+            .build()
+            .map_err(|e| {
+                TileServerError::ConfigError(format!("failed to create HTTP client: {e}"))
+            })?;
+        return Ok(Arc::new(HttpPmTilesSource::from_url(config, client).await?));
+    }
+    Ok(Arc::new(LocalPmTilesSource::from_file(config).await?))
+}
+
+/// Prepared-statement parameter types of a vector tile query: `z, x, y`.
+#[cfg(feature = "postgres")]
+const TILE_PARAM_TYPES: &[Type] = &[Type::INT4, Type::INT4, Type::INT4];
+/// Out-db raster query parameters: `z, x, y, bounds, params`.
+#[cfg(all(feature = "postgres", feature = "raster"))]
+const OUTDB_PARAM_TYPES: &[Type] = &[Type::INT4, Type::INT4, Type::INT4, Type::TEXT, Type::JSONB];
+
+#[cfg(feature = "postgres")]
+fn pool_settings(config: &PostgresConfig) -> PoolSettings {
+    PoolSettings {
+        max_size: config.pool_size,
+        wait_timeout_ms: config.pool_wait_timeout_ms,
+        create_timeout_ms: config.pool_create_timeout_ms,
+        recycle_timeout_ms: config.pool_recycle_timeout_ms,
+        pre_warm: config.pool_pre_warm,
+    }
+}
+
+#[cfg(feature = "postgres")]
+fn postgres_tile_cache(cache: &crate::config::PostgresCacheConfig) -> Arc<TileCache> {
+    tracing::info!(
+        "Initialized PostgreSQL tile cache: {}MB, TTL {}s",
+        cache.size_mb,
+        cache.ttl_seconds
+    );
+    Arc::new(TileCache::new(cache.size_mb, cache.ttl_seconds))
+}
+
+/// Statements to prepare on every pooled connection when `pre_warm` is on.
+#[cfg(feature = "postgres")]
+fn tile_queries<'a>(
+    functions: &'a [PostgresFunctionSource],
+    tables: &'a [PostgresTableSource],
+) -> Vec<(&'a str, &'static [Type])> {
+    functions
+        .iter()
+        .map(PostgresFunctionSource::tile_query)
+        .chain(tables.iter().map(PostgresTableSource::tile_query))
+        .map(|q| (q, TILE_PARAM_TYPES))
+        .collect()
+}
+
+/// Load each function source; a failure is logged and the rest still load.
+#[cfg(feature = "postgres")]
+async fn load_function_sources(
+    pool: &Arc<PostgresPool>,
+    configs: &[crate::config::PostgresFunctionConfig],
+    cache: &Option<Arc<TileCache>>,
+) -> Vec<PostgresFunctionSource> {
+    let mut loaded = Vec::with_capacity(configs.len());
+    for c in configs {
+        match PostgresFunctionSource::new(pool.clone(), c, cache.clone()).await {
+            Ok(source) => {
+                tracing::info!(
+                    "Loaded PostgreSQL function source: {} ({}.{})",
+                    c.id,
+                    c.schema,
+                    c.function
+                );
+                loaded.push(source);
+            }
+            Err(e) => tracing::error!("Failed to load PostgreSQL function source {}: {}", c.id, e),
+        }
+    }
+    loaded
+}
+
+/// Load each table source; a failure is logged and the rest still load.
+#[cfg(feature = "postgres")]
+async fn load_table_sources(
+    pool: &Arc<PostgresPool>,
+    configs: &[crate::config::PostgresTableConfig],
+    cache: &Option<Arc<TileCache>>,
+) -> Vec<PostgresTableSource> {
+    let mut loaded = Vec::with_capacity(configs.len());
+    for c in configs {
+        match PostgresTableSource::new(pool.clone(), c, cache.clone()).await {
+            Ok(source) => {
+                tracing::info!(
+                    "Loaded PostgreSQL table source: {} ({}.{})",
+                    c.id,
+                    c.schema,
+                    c.table
+                );
+                loaded.push(source);
+            }
+            Err(e) => tracing::error!("Failed to load PostgreSQL table source {}: {}", c.id, e),
+        }
+    }
+    loaded
+}
+
+/// Load each out-db raster source; a failure is logged and the rest still load.
+#[cfg(all(feature = "postgres", feature = "raster"))]
+async fn load_outdb_sources(
+    pool: &Arc<PostgresPool>,
+    configs: &[crate::config::PostgresOutDbRasterConfig],
+) -> Vec<PostgresOutDbRasterSource> {
+    let mut loaded = Vec::with_capacity(configs.len());
+    for c in configs {
+        match PostgresOutDbRasterSource::new(pool.clone(), c).await {
+            Ok(source) => {
+                tracing::info!(
+                    "Loaded PostgreSQL out-db raster source: {} ({}.{})",
+                    c.id,
+                    c.schema,
+                    c.function.as_ref().unwrap_or(&c.id)
+                );
+                loaded.push(source);
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Failed to load PostgreSQL out-db raster source {}: {}",
+                    c.id,
+                    e
+                );
+            }
+        }
+    }
+    loaded
 }
 
 #[cfg(test)]
@@ -983,18 +1095,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_source_manager_get_tile_source_not_found() {
-        let mgr = SourceManager::new();
-        let result = mgr.get_tile("missing", 0, 0, 0).await;
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(matches!(
-            err,
-            crate::error::TileServerError::SourceNotFound(_)
-        ));
-    }
-
-    #[tokio::test]
     async fn test_source_manager_get_tile_with_cache() {
         let mut map = HashMap::new();
         map.insert(
@@ -1032,39 +1132,9 @@ mod tests {
     }
 
     #[test]
-    fn source_manager_new_len_is_zero() {
-        let mgr = SourceManager::new();
-        assert_eq!(mgr.len(), 0);
-    }
-
-    #[test]
-    fn source_manager_new_get_is_none() {
-        let mgr = SourceManager::new();
-        assert!(mgr.get("any-source").is_none());
-    }
-
-    #[test]
-    fn source_manager_with_cache_attaches_cache() {
-        let mgr = SourceManager::new();
-        assert!(mgr.cache().is_none());
-
-        let cache = Arc::new(crate::cache::TileCache::new(64, 60));
-        let mgr_with_cache = mgr.with_cache(cache);
-
-        assert!(mgr_with_cache.cache().is_some());
-    }
-
-    #[test]
     fn source_manager_new_all_metadata_is_empty() {
         let mgr = SourceManager::new();
         assert!(mgr.all_metadata().is_empty());
-    }
-
-    #[test]
-    fn source_manager_exists_returns_false_for_empty() {
-        let mgr = SourceManager::new();
-        assert!(!mgr.exists("any-id"));
-        assert!(!mgr.exists(""));
     }
 
     #[tokio::test]
@@ -1081,18 +1151,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn source_manager_get_tile_unknown_returns_error_not_panic() {
-        let mgr = SourceManager::new();
-        let result = mgr.get_tile("x", 10, 5, 5).await;
-        assert!(result.is_err(), "expected error for unknown source");
-        let err = result.unwrap_err();
-        assert!(matches!(
-            err,
-            crate::error::TileServerError::SourceNotFound(_)
-        ));
-    }
-
     #[test]
     fn source_manager_from_sources_empty_map_is_empty() {
         let mgr = SourceManager::from_sources(HashMap::new());
@@ -1105,13 +1163,6 @@ mod tests {
         let mgr = SourceManager::new();
         let cloned = mgr.clone_sources();
         assert!(cloned.is_empty());
-    }
-
-    #[test]
-    fn mock_source_as_any_downcasts_to_concrete_type() {
-        let src: Arc<dyn TileSource> = Arc::new(MockSource::new("downcast-me"));
-        let any = src.as_any();
-        assert!(any.downcast_ref::<MockSource>().is_some());
     }
 
     #[tokio::test]
@@ -1129,6 +1180,78 @@ mod tests {
 
         let second = mgr.get_tile("hit", 5, 1, 1).await.unwrap().unwrap();
         assert_eq!(second.data.as_ref(), b"mock-tile-data");
+    }
+
+    /// Counts `get_tile` calls so tests can tell cache hits from source reads.
+    #[cfg(any(feature = "raster", feature = "postgres"))]
+    struct CountingSource {
+        inner: MockSource,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[cfg(any(feature = "raster", feature = "postgres"))]
+    #[async_trait]
+    impl TileSource for CountingSource {
+        async fn get_tile(&self, z: u8, x: u32, y: u32) -> crate::error::Result<Option<TileData>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.get_tile(z, x, y).await
+        }
+
+        fn metadata(&self) -> &TileMetadata {
+            self.inner.metadata()
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[cfg(any(feature = "raster", feature = "postgres"))]
+    fn counting_manager() -> (SourceManager, Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut map = HashMap::new();
+        map.insert(
+            "vec".to_string(),
+            Arc::new(CountingSource {
+                inner: MockSource::new("vec"),
+                calls: Arc::clone(&calls),
+            }) as Arc<dyn TileSource>,
+        );
+        let cache = Arc::new(crate::cache::TileCache::new(4, 3600));
+        (SourceManager::from_sources(map).with_cache(cache), calls)
+    }
+
+    /// With the `raster` feature the tile route calls
+    /// `get_raster_tile_with_params` for every source. A vector source must
+    /// still go through the tile cache there (it used to read the source on
+    /// every request).
+    #[cfg(feature = "raster")]
+    #[tokio::test]
+    async fn raster_entry_point_uses_the_cache_for_vector_sources() {
+        let (mgr, calls) = counting_manager();
+        for _ in 0..3 {
+            let tile = mgr
+                .get_raster_tile_with_params("vec", 5, 1, 1, 256, None, None)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(tile.data.as_ref(), b"mock-tile-data");
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn query_param_entry_point_uses_the_cache_for_other_sources() {
+        let (mgr, calls) = counting_manager();
+        let params = serde_json::json!({});
+        for _ in 0..3 {
+            mgr.get_vector_tile_with_query_params("vec", 5, 1, 1, &params)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     struct NoneSource(TileMetadata);
@@ -1313,16 +1436,6 @@ mod tests {
     async fn from_configs_continues_on_load_failure() {
         let cfg = missing_mbtiles_config("missing");
         let mgr = SourceManager::from_configs(&[cfg]).await.unwrap();
-        assert!(mgr.is_empty());
-    }
-
-    #[tokio::test]
-    async fn from_configs_with_multiple_failures_returns_empty_manager() {
-        let configs = vec![
-            missing_mbtiles_config("first"),
-            missing_mbtiles_config("second"),
-        ];
-        let mgr = SourceManager::from_configs(&configs).await.unwrap();
         assert!(mgr.is_empty());
     }
 

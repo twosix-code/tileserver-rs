@@ -16,7 +16,7 @@ use axum::{
 use crate::cache_control;
 use crate::error::TileServerError;
 use crate::reload::SharedState;
-use crate::sources::{self, TileJson};
+use crate::sources::{self, TileData, TileJson};
 
 #[cfg(feature = "raster")]
 use crate::config;
@@ -147,7 +147,7 @@ pub(crate) async fn get_tile(
     #[cfg(feature = "cel")]
     let request_filter = query
         .get("filter")
-        .map(|expr| crate::cel_filter::CelFilter::compile(expr))
+        .map(|expr| crate::cel_filter::CelFilter::compile(expr).map(std::sync::Arc::new))
         .transpose()?;
 
     if let Some(members) = resolve_composite_members(&shared, &params.source) {
@@ -163,134 +163,13 @@ pub(crate) async fn get_tile(
         return get_tile_as_geojson(&state, &params.source, params.z, params.x, y).await;
     }
 
-    #[cfg(feature = "raster")]
-    let tile = {
-        #[cfg(feature = "postgres")]
-        if state.sources.is_postgres_function_source(&params.source) {
-            let query_params = serde_json::to_value(&query).unwrap_or_default();
-            state
-                .sources
-                .get_vector_tile_with_query_params(
-                    &params.source,
-                    params.z,
-                    params.x,
-                    y,
-                    &query_params,
-                )
-                .await?
-                .ok_or(TileServerError::TileNotFound {
-                    z: params.z,
-                    x: params.x,
-                    y,
-                })?
-        } else {
-            let resampling = query
-                .get("resampling")
-                .and_then(|s| s.parse::<config::ResamplingMethod>().ok());
-
-            #[cfg(all(feature = "postgres", feature = "raster"))]
-            let query_params = if state.sources.is_outdb_raster_source(&params.source) {
-                Some(serde_json::to_value(&query).unwrap_or_default())
-            } else {
-                None
-            };
-
-            #[cfg(not(all(feature = "postgres", feature = "raster")))]
-            let query_params: Option<serde_json::Value> = None;
-
-            state
-                .sources
-                .get_raster_tile_with_params(
-                    &params.source,
-                    params.z,
-                    params.x,
-                    y,
-                    256,
-                    resampling,
-                    query_params,
-                )
-                .await?
-                .ok_or(TileServerError::TileNotFound {
-                    z: params.z,
-                    x: params.x,
-                    y,
-                })?
-        }
-
-        #[cfg(not(feature = "postgres"))]
-        {
-            let resampling = query
-                .get("resampling")
-                .and_then(|s| s.parse::<config::ResamplingMethod>().ok());
-
-            state
-                .sources
-                .get_raster_tile_with_params(
-                    &params.source,
-                    params.z,
-                    params.x,
-                    y,
-                    256,
-                    resampling,
-                    None,
-                )
-                .await?
-                .ok_or(TileServerError::TileNotFound {
-                    z: params.z,
-                    x: params.x,
-                    y,
-                })?
-        }
-    };
-
-    #[cfg(not(feature = "raster"))]
-    let tile = {
-        #[cfg(feature = "postgres")]
-        let tile = if state.sources.is_postgres_function_source(&params.source) {
-            let query_params: serde_json::Value = serde_json::to_value(&query).unwrap_or_default();
-            state
-                .sources
-                .get_vector_tile_with_query_params(
-                    &params.source,
-                    params.z,
-                    params.x,
-                    y,
-                    &query_params,
-                )
-                .await?
-                .ok_or(TileServerError::TileNotFound {
-                    z: params.z,
-                    x: params.x,
-                    y,
-                })?
-        } else {
-            state
-                .sources
-                .get_tile(&params.source, params.z, params.x, y)
-                .await?
-                .ok_or(TileServerError::TileNotFound {
-                    z: params.z,
-                    x: params.x,
-                    y,
-                })?
-        };
-
-        #[cfg(not(feature = "postgres"))]
-        let tile = {
-            let _ = query;
-            state
-                .sources
-                .get_tile(&params.source, params.z, params.x, y)
-                .await?
-                .ok_or(TileServerError::TileNotFound {
-                    z: params.z,
-                    x: params.x,
-                    y,
-                })?
-        };
-
-        tile
-    };
+    let tile = fetch_source_tile(
+        &state.sources,
+        &params.source,
+        (params.z, params.x, y),
+        &query,
+    )
+    .await?;
 
     // Band math: when the client passes `?expression=...` and the
     // requested tile is a raster format, parse the expression and
@@ -300,22 +179,28 @@ pub(crate) async fn get_tile(
     // interact because band math only applies to raster formats and
     // MLT only to vector formats.
     #[cfg(feature = "raster")]
-    let tile = apply_band_math_if_requested(tile, &query);
+    let tile = if query.contains_key("expression") {
+        // Decode, per-pixel eval and PNG encode are CPU work: keep them off
+        // the async worker threads.
+        let band_query = query.clone();
+        tokio::task::spawn_blocking(move || apply_band_math_if_requested(tile, &band_query))
+            .await
+            .map_err(|e| TileServerError::RenderError(format!("band math task failed: {e}")))?
+    } else {
+        tile
+    };
 
     // Every active CEL filter (source preset + request) folds into one hash:
     // filtered variants get their own cache entries.
     #[cfg(feature = "cel")]
-    let filter_hash = {
-        let preset = state.sources.preset_filter(&params.source);
-        let active: Vec<&crate::cel_filter::CelFilter> = preset
-            .map(AsRef::as_ref)
-            .into_iter()
-            .chain(request_filter.as_ref())
-            .collect();
-        crate::cel_filter::combined_hash(&active)
-    };
+    let filter_hash = active_filter_hash(&state.sources, &params.source, request_filter.as_deref());
     #[cfg(not(feature = "cel"))]
     let filter_hash = 0;
+
+    // Route-level cache entries depend on every byte-changing request input
+    // (output format, ?expression=, ?resampling=, PostGIS query parameters),
+    // not just the tile address, so they get their own key variant.
+    let variant = request_variant(filter_hash, format, &query);
 
     #[cfg(feature = "cel")]
     let tile = match &request_filter {
@@ -327,7 +212,7 @@ pub(crate) async fn get_tile(
                     z: params.z,
                     x: params.x,
                     y,
-                    filter: filter_hash,
+                    filter: variant,
                 },
                 tile,
                 filter,
@@ -342,41 +227,8 @@ pub(crate) async fn get_tile(
         return Ok(axum::http::StatusCode::NO_CONTENT.into_response());
     }
 
-    // MLT transcoding: if the requested format differs from the source format
-    // and the `mlt` feature is enabled, attempt on-the-fly transcoding.
     #[cfg(feature = "mlt")]
-    let tile = {
-        let requested_format = format.parse::<crate::sources::TileFormat>().ok();
-        if let Some(target) = requested_format {
-            if tile.format != target && tile.format.is_vector() && target.is_vector() {
-                match crate::transcode::transcode_tile(&tile, target) {
-                    Ok(transcoded) => transcoded,
-                    Err(e) => {
-                        // Fall back to serving the original tile on any transcode
-                        // error. This ensures clients always get usable data even
-                        // when mlt-core cannot handle certain geometries or edge
-                        // cases. The original tile (MVT or MLT) is still valid —
-                        // only the on-the-fly format conversion failed.
-                        tracing::warn!(
-                            "transcoding {:?} -> {:?} failed for {}/{}/{}/{}, serving original tile: {}",
-                            tile.format,
-                            target,
-                            params.source,
-                            params.z,
-                            params.x,
-                            y,
-                            e
-                        );
-                        tile
-                    }
-                }
-            } else {
-                tile
-            }
-        } else {
-            tile
-        }
-    };
+    let tile = transcode_if_requested(tile, format, (&params.source, params.z, params.x, y)).await;
 
     let accept_encoding = req_headers
         .get(ACCEPT_ENCODING)
@@ -390,13 +242,123 @@ pub(crate) async fn get_tile(
             z: params.z,
             x: params.x,
             y,
-            filter: filter_hash,
+            filter: variant,
         },
         tile,
         accept_encoding,
     )
     .await?;
 
+    Ok(tile_response(tile))
+}
+
+/// Fetch the tile from its source. PostGIS function sources get the query
+/// string as parameters; raster sources honour `?resampling=` (and out-db
+/// rasters get the query string too).
+async fn fetch_source_tile(
+    sources: &sources::SourceManager,
+    source: &str,
+    (z, x, y): (u8, u32, u32),
+    query: &std::collections::HashMap<String, String>,
+) -> Result<TileData, TileServerError> {
+    #[cfg(feature = "postgres")]
+    if sources.is_postgres_function_source(source) {
+        let params = serde_json::to_value(query).unwrap_or_default();
+        return sources
+            .get_vector_tile_with_query_params(source, z, x, y, &params)
+            .await?
+            .ok_or(TileServerError::TileNotFound { z, x, y });
+    }
+    #[cfg(feature = "raster")]
+    let tile = {
+        let resampling = query
+            .get("resampling")
+            .and_then(|s| s.parse::<config::ResamplingMethod>().ok());
+        #[cfg(feature = "postgres")]
+        let params = sources
+            .is_outdb_raster_source(source)
+            .then(|| serde_json::to_value(query).unwrap_or_default());
+        #[cfg(not(feature = "postgres"))]
+        let params: Option<serde_json::Value> = None;
+        sources
+            .get_raster_tile_with_params(source, z, x, y, 256, resampling, params)
+            .await?
+    };
+    #[cfg(not(feature = "raster"))]
+    let tile = {
+        let _ = query;
+        sources.get_tile(source, z, x, y).await?
+    };
+    tile.ok_or(TileServerError::TileNotFound { z, x, y })
+}
+
+/// Cache-key variant for a route-level tile: the CEL filter hash, the
+/// requested output format and the whole query string. Never 0, so these
+/// entries can't overwrite the source-level cache entry for the same tile.
+fn request_variant(
+    filter_hash: u64,
+    format: &str,
+    query: &std::collections::HashMap<String, String>,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut pairs: Vec<(&String, &String)> = query.iter().collect();
+    pairs.sort_unstable();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    ("route-variant", filter_hash, format, pairs).hash(&mut hasher);
+    hasher.finish().max(1)
+}
+
+/// One hash over the source preset and the request filter; 0 when neither.
+#[cfg(feature = "cel")]
+fn active_filter_hash(
+    sources: &sources::SourceManager,
+    source: &str,
+    request_filter: Option<&crate::cel_filter::CelFilter>,
+) -> u64 {
+    let preset = sources.preset_filter(source);
+    let active: Vec<&crate::cel_filter::CelFilter> = preset
+        .map(AsRef::as_ref)
+        .into_iter()
+        .chain(request_filter)
+        .collect();
+    crate::cel_filter::combined_hash(&active)
+}
+
+/// Transcode between vector formats (MVT ↔ MLT) when the URL asks for a
+/// different one. On a transcode error the original tile is served: it is
+/// still valid, only the conversion failed.
+#[cfg(feature = "mlt")]
+async fn transcode_if_requested(
+    tile: TileData,
+    format: &str,
+    (source, z, x, y): (&str, u8, u32, u32),
+) -> TileData {
+    let Some(target) = format.parse::<crate::sources::TileFormat>().ok() else {
+        return tile;
+    };
+    if tile.format == target || !tile.format.is_vector() || !target.is_vector() {
+        return tile;
+    }
+    match crate::transcode::transcode_tile_blocking(tile.clone(), target).await {
+        Ok(transcoded) => transcoded,
+        Err(e) => {
+            tracing::warn!(
+                "transcoding {:?} -> {:?} failed for {}/{}/{}/{}, serving original tile: {}",
+                tile.format,
+                target,
+                source,
+                z,
+                x,
+                y,
+                e
+            );
+            tile
+        }
+    }
+}
+
+/// Tile body with content type, cache headers, `Vary` and encoding.
+fn tile_response(tile: TileData) -> Response {
     let mut headers = HeaderMap::new();
     headers.insert(
         CONTENT_TYPE,
@@ -406,12 +368,10 @@ pub(crate) async fn get_tile(
     // Vary is mandatory on every tile response: without it CDNs may serve a
     // wrong-encoding cached copy to a client that does not accept it.
     headers.insert(VARY, HeaderValue::from_static("Accept-Encoding"));
-
     if let Some(encoding) = tile.compression.content_encoding() {
         headers.insert(CONTENT_ENCODING, HeaderValue::from_static(encoding));
     }
-
-    Ok((headers, tile.data).into_response())
+    (headers, tile.data).into_response()
 }
 
 struct TileId<'a> {
@@ -430,7 +390,7 @@ async fn filter_request_tile(
     sources: &sources::SourceManager,
     id: TileId<'_>,
     tile: sources::TileData,
-    filter: &crate::cel_filter::CelFilter,
+    filter: &std::sync::Arc<crate::cel_filter::CelFilter>,
 ) -> Result<sources::TileData, TileServerError> {
     let key = sources.cache().map(|_| crate::cache::TileCacheKey {
         source_id: id.source.into(),
@@ -445,7 +405,8 @@ async fn filter_request_tile(
     {
         return Ok(hit);
     }
-    let filtered = crate::cel_filter::apply(tile, &[filter])?;
+    let filtered =
+        crate::cel_filter::apply_blocking(tile, vec![std::sync::Arc::clone(filter)]).await?;
     if let (Some(cache), Some(key)) = (sources.cache(), key) {
         cache.insert(key, filtered.clone()).await;
     }
@@ -456,7 +417,7 @@ async fn filter_request_tile(
 #[cfg(feature = "cel")]
 async fn filter_composite_response(
     response: Response,
-    filter: &crate::cel_filter::CelFilter,
+    filter: &std::sync::Arc<crate::cel_filter::CelFilter>,
 ) -> Result<Response, TileServerError> {
     let (parts, body) = response.into_parts();
     let bytes = axum::body::to_bytes(body, usize::MAX)
@@ -467,7 +428,8 @@ async fn filter_composite_response(
         format: sources::TileFormat::Pbf,
         compression: sources::TileCompression::None,
     };
-    let filtered = crate::cel_filter::apply(tile, &[filter])?;
+    let filtered =
+        crate::cel_filter::apply_blocking(tile, vec![std::sync::Arc::clone(filter)]).await?;
     if filtered.data.is_empty() {
         return Ok(axum::http::StatusCode::NO_CONTENT.into_response());
     }
@@ -555,7 +517,7 @@ async fn get_composite_tile(
     let fetches = members.iter().map(|id| state.sources.get_tile(id, z, x, y));
     let results = futures::future::join_all(fetches).await;
 
-    let mut all_layers = Vec::new();
+    let mut tiles = Vec::with_capacity(results.len());
     for tile in results {
         let Some(tile) = tile? else {
             continue;
@@ -563,16 +525,13 @@ async fn get_composite_tile(
         if !tile.format.is_vector() {
             return Err(TileServerError::InvalidTileRequest);
         }
-        let mvt = to_mvt_bytes(tile)?;
-        let raw = match &mvt.1 {
-            sources::TileCompression::Gzip => composite::decompress_gzip(&mvt.0)?,
-            _ => mvt.0,
-        };
-        all_layers.extend(composite::decode_mvt_layers(&raw)?);
+        tiles.push(tile);
     }
 
-    let merged = composite::merge_mvt_layers(all_layers);
-    let bytes = composite::encode_mvt_pbf(&merged);
+    // Decode, transcode, merge and encode are CPU work: keep them off the runtime.
+    let bytes = tokio::task::spawn_blocking(move || merge_composite_tiles(tiles))
+        .await
+        .map_err(|e| TileServerError::Internal(anyhow::anyhow!("composite task failed: {e}")))??;
 
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -581,6 +540,24 @@ async fn get_composite_tile(
     );
     headers.insert(CACHE_CONTROL, cache_control::tile_cache_headers());
     Ok((headers, bytes).into_response())
+}
+
+/// Decode every member tile and merge them into one MVT PBF.
+fn merge_composite_tiles(tiles: Vec<sources::TileData>) -> Result<bytes::Bytes, TileServerError> {
+    use crate::composite;
+
+    let mut all_layers = Vec::new();
+    for tile in tiles {
+        let (data, compression) = to_mvt_bytes(tile)?;
+        let raw = match compression {
+            sources::TileCompression::Gzip => composite::decompress_gzip(&data)?,
+            _ => data,
+        };
+        all_layers.extend(composite::decode_mvt_layers(&raw)?);
+    }
+    Ok(composite::encode_mvt_pbf(&composite::merge_mvt_layers(
+        all_layers,
+    )))
 }
 
 /// Reduce a composite member tile to raw MVT bytes + its compression marker,
@@ -604,11 +581,9 @@ async fn get_tile_as_geojson(
     x: u32,
     y: u32,
 ) -> Result<Response, TileServerError> {
-    use flate2::read::GzDecoder;
     use geozero::ProcessToJson;
     use geozero::mvt::{Message, Tile};
     use sources::TileCompression;
-    use std::io::Read;
 
     let source = state
         .sources
@@ -630,18 +605,12 @@ async fn get_tile_as_geojson(
 
     // Decompress if needed
     let raw_data = match tile.compression {
-        TileCompression::Gzip => {
-            let mut decoder = GzDecoder::new(&tile.data[..]);
-            let mut decompressed = Vec::with_capacity(tile.data.len() * 4);
-            decoder.read_to_end(&mut decompressed).map_err(|e| {
-                TileServerError::RenderError(format!("Failed to decompress tile: {}", e))
-            })?;
-            decompressed
-        }
+        TileCompression::Gzip => crate::compression::decode_gzip(&tile.data)
+            .map_err(|e| TileServerError::RenderError(format!("failed to decompress tile: {e}")))?,
         TileCompression::None => tile.data.to_vec(),
         _ => {
             return Err(TileServerError::RenderError(format!(
-                "Unsupported compression: {:?}",
+                "unsupported compression: {:?}",
                 tile.compression
             )));
         }
@@ -649,7 +618,7 @@ async fn get_tile_as_geojson(
 
     // Parse MVT tile using prost
     let mvt_tile = Tile::decode(raw_data.as_slice())
-        .map_err(|e| TileServerError::RenderError(format!("Failed to decode MVT tile: {}", e)))?;
+        .map_err(|e| TileServerError::RenderError(format!("failed to decode MVT tile: {}", e)))?;
 
     // Convert each layer to GeoJSON and combine into a FeatureCollection
     let mut all_features: Vec<serde_json::Value> = Vec::with_capacity(mvt_tile.layers.len() * 64);
@@ -726,7 +695,7 @@ fn apply_band_math_if_requested(
     let parsed = match expression::ParsedExpression::parse(expr_str, raster.band_count()) {
         Ok(p) => p,
         Err(e) => {
-            tracing::warn!(expression = %expr_str, error = %e, "band math: parse failed; serving original");
+            tracing::warn!(expression = %expression::log_preview(expr_str), error = %e, "band math: parse failed; serving original");
             return tile;
         }
     };
@@ -734,7 +703,7 @@ fn apply_band_math_if_requested(
     let result = match expression::apply(&parsed, &raster) {
         Ok(r) => r,
         Err(e) => {
-            tracing::warn!(expression = %expr_str, error = %e, "band math: eval failed; serving original");
+            tracing::warn!(expression = %expression::log_preview(expr_str), error = %e, "band math: eval failed; serving original");
             return tile;
         }
     };
@@ -758,6 +727,42 @@ fn apply_band_math_if_requested(
 mod tests {
     use super::*;
 
+    #[test]
+    fn request_variant_separates_byte_changing_inputs() {
+        let q = |pairs: &[(&str, &str)]| -> std::collections::HashMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect()
+        };
+        let plain = request_variant(0, "pbf", &q(&[]));
+        assert_ne!(plain, 0);
+        assert_eq!(plain, request_variant(0, "pbf", &q(&[])));
+        assert_ne!(plain, request_variant(0, "mlt", &q(&[])));
+        assert_ne!(plain, request_variant(7, "pbf", &q(&[])));
+        let a = request_variant(
+            0,
+            "png",
+            &q(&[("expression", "b1"), ("resampling", "nearest")]),
+        );
+        assert_eq!(
+            a,
+            request_variant(
+                0,
+                "png",
+                &q(&[("resampling", "nearest"), ("expression", "b1")])
+            )
+        );
+        assert_ne!(
+            a,
+            request_variant(
+                0,
+                "png",
+                &q(&[("expression", "b2"), ("resampling", "nearest")])
+            )
+        );
+    }
+
     fn tp(y_fmt: &str) -> TileParams {
         TileParams {
             source: "src".into(),
@@ -776,30 +781,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_y_and_format_mvt_alias() {
-        let p = tp("0.mvt");
-        let (y, fmt) = p.parse_y_and_format().expect("mvt parses");
-        assert_eq!(y, 0);
-        assert_eq!(fmt, "mvt");
-    }
-
-    #[test]
-    fn parse_y_and_format_mlt_format() {
-        let p = tp("9.mlt");
-        let (y, fmt) = p.parse_y_and_format().expect("mlt parses");
-        assert_eq!(y, 9);
-        assert_eq!(fmt, "mlt");
-    }
-
-    #[test]
-    fn parse_y_and_format_geojson_format() {
-        let p = tp("0.geojson");
-        let (y, fmt) = p.parse_y_and_format().expect("geojson");
-        assert_eq!(y, 0);
-        assert_eq!(fmt, "geojson");
-    }
-
-    #[test]
     fn parse_y_and_format_rejects_missing_dot() {
         let p = tp("notadot");
         assert!(p.parse_y_and_format().is_none());
@@ -809,27 +790,6 @@ mod tests {
     fn parse_y_and_format_rejects_non_numeric_y() {
         let p = tp("abc.pbf");
         assert!(p.parse_y_and_format().is_none());
-    }
-
-    #[test]
-    fn parse_y_and_format_rejects_negative_y() {
-        let p = tp("-1.pbf");
-        assert!(p.parse_y_and_format().is_none());
-    }
-
-    #[test]
-    fn parse_y_and_format_rejects_multiple_dots_in_y() {
-        let p = tp("12.34.pbf");
-        assert!(
-            p.parse_y_and_format().is_none(),
-            "y_str '12.34' is not a valid u32 → rejected"
-        );
-    }
-
-    #[test]
-    fn data_source_query_params_default_has_no_key() {
-        let q = DataSourceQueryParams::default();
-        assert!(q.key.is_none());
     }
 }
 

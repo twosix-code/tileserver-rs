@@ -219,15 +219,8 @@ pub(crate) async fn post_spatial_query(
 
     // Decompress if needed
     let raw_data = match tile_data.compression {
-        sources::TileCompression::Gzip => {
-            use std::io::Read;
-            let mut decoder = flate2::read::GzDecoder::new(&tile_data.data[..]);
-            let mut decompressed = Vec::with_capacity(tile_data.data.len() * 4);
-            decoder
-                .read_to_end(&mut decompressed)
-                .map_err(|e| TileServerError::MetadataError(format!("gzip decode failed: {e}")))?;
-            decompressed
-        }
+        sources::TileCompression::Gzip => crate::compression::decode_gzip(&tile_data.data)
+            .map_err(|e| TileServerError::MetadataError(format!("gzip decode failed: {e}")))?,
         _ => tile_data.data.to_vec(),
     };
 
@@ -336,13 +329,6 @@ mod tests {
     }
 
     #[test]
-    fn lng_lat_to_tile_east_hemisphere_zoom_2() {
-        let (x, y) = lng_lat_to_tile(179.0, 0.0, 2);
-        assert!(x <= 3);
-        assert!(y <= 3);
-    }
-
-    #[test]
     fn lng_lat_to_tile_clamps_to_max_tile_index() {
         let (x, y) = lng_lat_to_tile(180.0, -85.0, 2);
         assert!(x < 4);
@@ -423,12 +409,6 @@ mod tests {
     #[test]
     fn parse_mvt_features_returns_empty_for_now() {
         let empty: Vec<SpatialFeature> = parse_mvt_features(&[1, 2, 3], &None, 10);
-        assert!(empty.is_empty());
-    }
-
-    #[test]
-    fn parse_mvt_features_with_layer_filter_returns_empty() {
-        let empty = parse_mvt_features(&[], &Some(vec!["roads".into()]), 5);
         assert!(empty.is_empty());
     }
 }

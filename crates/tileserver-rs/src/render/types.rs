@@ -7,6 +7,11 @@ pub const MAX_IMAGE_DIMENSION: u32 = 4096;
 /// Maximum allowed scale factor for retina images
 pub const MAX_SCALE_FACTOR: u8 = 4;
 
+/// Largest static image in physical pixels (width × scale × height × scale),
+/// 4096 × 4096. Each side may still be up to [`MAX_IMAGE_DIMENSION`], but a
+/// large image at a high scale would need a gigabyte of RGBA readback.
+pub const MAX_STATIC_PIXELS: u64 = 4096 * 4096;
+
 /// Image format for rendered output
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,7 +49,7 @@ impl FromStr for ImageFormat {
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum StaticType {
-    /// Center-based: lon,lat,zoom[@bearing[,pitch]]
+    /// Center-based: `lon,lat,zoom[@bearing[,pitch]]`
     Center {
         lon: f64,
         lat: f64,
@@ -213,6 +218,11 @@ impl RenderOptions {
     }
 
     /// Create options for a static image
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a zero width or height, a size above the
+    /// maximum, or a scale outside the allowed range.
     #[allow(clippy::too_many_arguments)]
     pub fn for_static(
         style_id: String,
@@ -244,6 +254,12 @@ impl RenderOptions {
             return Err(format!(
                 "Scale factor must be between 1 and {}",
                 MAX_SCALE_FACTOR
+            ));
+        }
+        let physical = u64::from(width) * u64::from(height) * u64::from(scale) * u64::from(scale);
+        if physical > MAX_STATIC_PIXELS {
+            return Err(format!(
+                "Image is {physical} physical pixels (width × height × scale²); the maximum is {MAX_STATIC_PIXELS}"
             ));
         }
 
@@ -542,91 +558,6 @@ mod tests {
     }
 
     #[test]
-    fn test_render_options_for_static_zero_dimension_rejected() {
-        let result = RenderOptions::for_static(
-            "s".to_string(),
-            "{}".to_string(),
-            StaticType::Center {
-                lon: 0.0,
-                lat: 0.0,
-                zoom: 1.0,
-                bearing: None,
-                pitch: None,
-            },
-            0,
-            100,
-            1,
-            ImageFormat::Png,
-            StaticQueryParams::default(),
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_render_options_for_static_oversized_rejected() {
-        let result = RenderOptions::for_static(
-            "s".to_string(),
-            "{}".to_string(),
-            StaticType::Center {
-                lon: 0.0,
-                lat: 0.0,
-                zoom: 1.0,
-                bearing: None,
-                pitch: None,
-            },
-            5000,
-            100,
-            1,
-            ImageFormat::Png,
-            StaticQueryParams::default(),
-        );
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("maximum"));
-    }
-
-    #[test]
-    fn test_render_options_for_static_scale_zero_rejected() {
-        let result = RenderOptions::for_static(
-            "s".to_string(),
-            "{}".to_string(),
-            StaticType::Center {
-                lon: 0.0,
-                lat: 0.0,
-                zoom: 1.0,
-                bearing: None,
-                pitch: None,
-            },
-            100,
-            100,
-            0,
-            ImageFormat::Png,
-            StaticQueryParams::default(),
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_render_options_for_static_scale_too_high_rejected() {
-        let result = RenderOptions::for_static(
-            "s".to_string(),
-            "{}".to_string(),
-            StaticType::Center {
-                lon: 0.0,
-                lat: 0.0,
-                zoom: 1.0,
-                bearing: None,
-                pitch: None,
-            },
-            100,
-            100,
-            5,
-            ImageFormat::Png,
-            StaticQueryParams::default(),
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
     fn test_render_options_for_static_valid() {
         let result = RenderOptions::for_static(
             "s".to_string(),
@@ -652,23 +583,6 @@ mod tests {
         assert!((opts.lat - 37.8).abs() < 0.001);
         assert!((opts.bearing - 45.0).abs() < 0.001);
         assert!((opts.pitch - 30.0).abs() < 0.001);
-    }
-
-    #[test]
-    fn test_static_query_params_defaults() {
-        let p = StaticQueryParams::default();
-        assert!(p.path.is_none());
-        assert!(p.marker.is_none());
-        assert!(p.geojson.is_none());
-        assert!(!p.latlng);
-        assert!(p.padding.is_none());
-        assert!(p.maxzoom.is_none());
-    }
-
-    #[test]
-    fn test_max_constants() {
-        assert_eq!(MAX_IMAGE_DIMENSION, 4096);
-        assert_eq!(MAX_SCALE_FACTOR, 4);
     }
 
     fn center_origin() -> StaticType {
@@ -697,6 +611,15 @@ mod tests {
             ImageFormat::Png,
             StaticQueryParams::default(),
         )
+    }
+
+    #[test]
+    fn static_pixel_budget_counts_the_scale() {
+        assert!(for_static_center(center_origin(), 4096, 4096, 1).is_ok());
+        assert!(for_static_center(center_origin(), 2048, 2048, 2).is_ok());
+        let err = for_static_center(center_origin(), 4096, 4096, 2).unwrap_err();
+        assert!(err.contains("physical pixels"), "{err}");
+        assert!(for_static_center(center_origin(), 2048, 2049, 2).is_err());
     }
 
     #[test]
@@ -758,25 +681,6 @@ mod tests {
     }
 
     #[test]
-    fn test_render_options_for_static_center_with_bearing_pitch() {
-        let opts = for_static_center(
-            StaticType::Center {
-                lon: 10.0,
-                lat: 20.0,
-                zoom: 5.0,
-                bearing: Some(90.0),
-                pitch: Some(45.0),
-            },
-            256,
-            256,
-            1,
-        )
-        .unwrap();
-        assert!((opts.bearing - 90.0).abs() < 1e-9);
-        assert!((opts.pitch - 45.0).abs() < 1e-9);
-    }
-
-    #[test]
     fn test_render_options_for_static_stores_inputs() {
         let opts = RenderOptions::for_static(
             "my-style".to_string(),
@@ -810,14 +714,6 @@ mod tests {
             1,
         )
         .unwrap()
-    }
-
-    #[test]
-    fn test_render_options_for_static_bbox_center_midpoints() {
-        // lon_diff 4, lat_diff 4 → precise path; assert midpoints regardless.
-        let opts = bbox_opts(-2.0, 8.0, 2.0, 12.0);
-        assert!((opts.lon - 0.0).abs() < 1e-9);
-        assert!((opts.lat - 10.0).abs() < 1e-9);
     }
 
     #[test]

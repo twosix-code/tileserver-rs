@@ -17,18 +17,20 @@ use crate::sources::{TileCompression, TileData, TileFormat, TileMetadata, TileSo
 const WEB_MERCATOR_EXTENT: f64 = 20037508.342789244;
 
 pub struct CogSource {
-    /// Base (full-resolution) pool for this COG. Handles are borrowed per
-    /// render and returned to the pool on drop, so base tiles render in
-    /// parallel just like overview tiles. No `Dataset` is held here: the pool
-    /// owns the open handles.
-    base_pool: Arc<dataset_cache::Pool>,
+
     metadata: TileMetadata,
     default_resampling: ResamplingMethod,
     band_count: usize,
     colormap: Option<ColorMapConfig>,
-    /// COG source path — kept so we can re-open the dataset with an
+    /// COG source path. It is the `dataset_cache` key of the base pool, and
+    /// the path the overview pools (`{path}#ovr{n}`) re-open with an
     /// `OVERVIEW_LEVEL=N` open option when a low-zoom tile is smaller
-    /// than the full-resolution source.  This is the titiler/rio-tiler
+    /// than the full-resolution source.
+    ///
+    /// The source holds the path, not an `Arc<Pool>`: every render looks the
+    /// pool up in the cache (a moka hit). A held `Arc` would keep a pool alive
+    /// after reclaim or the TTL removed it from the cache, where reclaim can
+    /// never reach its idle handles again.  This is the titiler/rio-tiler
     /// `get_overview_level` optimisation; without it a z0 world tile
     /// forces GDAL to read the entire source raster.
     path: String,
@@ -41,6 +43,10 @@ pub struct CogSource {
 }
 
 impl CogSource {
+    /// # Errors
+    ///
+    /// [`TileServerError::RasterError`] when the file cannot be opened, has
+    /// no raster bands, or has no usable georeferencing.
     pub async fn from_file(config: &SourceConfig) -> Result<Self> {
         // Normalise remote paths to a GDAL VSI prefix so `/vsicurl/` range
         // reads are used. A bare `https://…` URL makes GDAL fall back to its
@@ -61,13 +67,12 @@ impl CogSource {
         // cost that would otherwise be paid on every STAC-mosaic asset
         // render.  See `dataset_cache` for eviction policy.
         //
-        // The cache stores a *pool* per key. This source keeps an `Arc` to
-        // that pool and borrows a handle per render (base and overview alike),
-        // rather than detaching one handle for its own lifetime. Detaching
-        // would leave the pool empty after `limit` sources and defeat the
-        // cache. We borrow one handle now purely to read the metadata
-        // (band count / bounds / overview resolutions) and immediately return
-        // it to the pool.
+
+        // The cache stores a *pool* per key, and a render borrows one handle
+        // from it (base and overview alike). We borrow one handle now only to
+        // read the metadata (band count / bounds / overview resolutions) and
+        // return it to the pool at once. The source keeps the path, not the
+        // pool; see the `path` field.
         let pool = dataset_cache::global().get_or_open(&path).await?;
         let band_count;
         let bounds;
@@ -86,7 +91,8 @@ impl CogSource {
                         "COG file has no raster bands".to_string(),
                     ));
                 }
-                let bounds = get_wgs84_bounds(guard)?;
+
+                let bounds = wgs84_bounds(guard)?;
                 let overview_resolutions = compute_overview_resolutions(guard)?;
                 Ok::<_, TileServerError>((band_count, bounds, overview_resolutions))
             })
@@ -115,7 +121,7 @@ impl CogSource {
         };
 
         Ok(Self {
-            base_pool: pool,
+
             metadata,
             default_resampling: resampling,
             band_count,
@@ -130,14 +136,20 @@ impl CogSource {
         self.default_resampling
     }
 
-    /// Share this source's base pool so a wrapping source (e.g. a DEM source
-    /// whose `input_source` points here) can borrow handles from the same
-    /// cached float bands without re-opening the file.
+
+    /// The source path, which is also the `dataset_cache` key of the base
+    /// pool. A wrapping source (e.g. a DEM source whose `input_source` points
+    /// here) looks up the same pool with it, so it shares the cached handles
+    /// without a second open.
     #[must_use]
-    pub fn base_pool(&self) -> Arc<dataset_cache::Pool> {
-        Arc::clone(&self.base_pool)
+    pub fn path(&self) -> &str {
+        &self.path
     }
 
+    /// # Errors
+    ///
+    /// [`TileServerError::RasterError`] when the tile cannot be warped or
+    /// encoded.
     pub async fn get_tile_with_resampling(
         &self,
         z: u8,
@@ -154,7 +166,7 @@ impl CogSource {
         let band_count = self.band_count;
         let colormap = self.colormap.clone();
         let path = self.path.clone();
-        let base_pool = Arc::clone(&self.base_pool);
+
 
         // `overview_index` of 0 means "read the full-resolution base". Any
         // other value means "read from overview level `overview_index - 1`",
@@ -174,7 +186,8 @@ impl CogSource {
         // The overview-pool cache lookup is async and runs on the async
         // runtime, before the blocking render is spawned.
         let render_pool: Arc<dataset_cache::Pool> = if overview_index == 0 {
-            base_pool
+
+            dataset_cache::global().get_or_open(&path).await?
         } else {
             let ovr_level = overview_index - 1;
             let ovr_arg = format!("OVERVIEW_LEVEL={ovr_level}");
@@ -332,28 +345,25 @@ fn tile_to_web_mercator_bbox(z: u8, x: u32, y: u32) -> (f64, f64, f64, f64) {
     (minx, miny, maxx, maxy)
 }
 
+/// The dataset's extent as `[west, south, east, north]` in WGS84 degrees.
 pub(crate) fn wgs84_bounds(dataset: &Dataset) -> Result<[f64; 4]> {
-    get_wgs84_bounds(dataset)
-}
-
-fn get_wgs84_bounds(dataset: &Dataset) -> Result<[f64; 4]> {
     let transform = dataset
         .geo_transform()
-        .map_err(|e| TileServerError::RasterError(format!("Failed to get geotransform: {}", e)))?;
+        .map_err(|e| TileServerError::RasterError(format!("failed to get geotransform: {}", e)))?;
 
     let (width, height) = dataset.raster_size();
 
     let src_srs = dataset.spatial_ref().map_err(|e| {
-        TileServerError::RasterError(format!("Failed to get spatial reference: {}", e))
+        TileServerError::RasterError(format!("failed to get spatial reference: {}", e))
     })?;
 
     let mut dst_srs = SpatialRef::from_epsg(4326)
-        .map_err(|e| TileServerError::RasterError(format!("Failed to create WGS84 SRS: {}", e)))?;
+        .map_err(|e| TileServerError::RasterError(format!("failed to create WGS84 SRS: {}", e)))?;
     dst_srs.set_axis_mapping_strategy(gdal::spatial_ref::AxisMappingStrategy::TraditionalGisOrder);
 
     let coord_transform =
         gdal::spatial_ref::CoordTransform::new(&src_srs, &dst_srs).map_err(|e| {
-            TileServerError::RasterError(format!("Failed to create coordinate transform: {}", e))
+            TileServerError::RasterError(format!("failed to create coordinate transform: {}", e))
         })?;
 
     let ulx = transform[0];
@@ -368,7 +378,7 @@ fn get_wgs84_bounds(dataset: &Dataset) -> Result<[f64; 4]> {
     coord_transform
         .transform_coords(&mut xs, &mut ys, &mut zs)
         .map_err(|e| {
-            TileServerError::RasterError(format!("Failed to transform coordinates: {}", e))
+            TileServerError::RasterError(format!("failed to transform coordinates: {}", e))
         })?;
 
     let min_lon = xs.iter().cloned().fold(f64::INFINITY, f64::min);
@@ -398,177 +408,198 @@ fn render_tile_from_dataset(
     resampling: ResamplingMethod,
     colormap: Option<&ColorMapConfig>,
 ) -> Result<Vec<u8>> {
-    let web_mercator = SpatialRef::from_epsg(3857)
-        .map_err(|e| TileServerError::RasterError(format!("Failed to create EPSG:3857: {}", e)))?;
-
-    let mem_driver = DriverManager::get_driver_by_name("MEM")
-        .map_err(|e| TileServerError::RasterError(format!("Failed to get MEM driver: {}", e)))?;
-
-    let use_colormap = colormap.is_some() && band_count == 1;
-    // Band layout of the MEM warp destination:
-    //   - 1 band + colormap → single f64 band (colormap lookup below)
-    //   - ≥ 3 source bands → 4-band RGBA: R, G, B plus a destination ALPHA
-    //     band maintained by the warp kernel (gdalwarp -dstalpha
-    //     semantics). A source alpha band (e.g. a 4-band RGBA COG) feeds
-    //     the source density; without one every valid source pixel is
-    //     dense. This keeps out-of-footprint areas transparent instead of
-    //     opaque black — matching rio-tiler/TiTiler behaviour.
-    //   - 1 or 2 source bands without colormap → legacy layout (gray or
-    //     R,G), forced fully opaque below.
-    let rgb_with_alpha = !use_colormap && band_count >= 3;
-    let output_bands = if use_colormap {
-        1
-    } else if rgb_with_alpha {
-        4
-    } else {
-        band_count.min(4)
+    let layout = BandLayout::new(band_count, colormap);
+    let warped = warp_destination(layout, [minx, miny, maxx, maxy], tile_size)?;
+    crate::sources::warp::reproject(dataset, &warped, resampling)?;
+    let img = match layout {
+        BandLayout::Colormap(cmap) => colormap_image(&warped, tile_size, cmap, resampling)?,
+        BandLayout::RgbAlpha => bands_image(&warped, 4, tile_size, resampling)?,
+        BandLayout::Plain(bands) => {
+            let mut img = bands_image(&warped, bands, tile_size, resampling)?;
+            make_opaque(&mut img, bands);
+            img
+        }
     };
+    let mut png_data = Vec::new();
+    img.write_to(&mut Cursor::new(&mut png_data), image::ImageFormat::Png)
+        .map_err(|e| TileServerError::RasterError(format!("failed to encode PNG: {e}")))?;
+    Ok(png_data)
+}
 
-    // Byte-typed destination so the warp kernel writes byte-range alpha
-    // (for non-Byte alpha bands the kernel writes 0..1 densities, which a
-    // u8 read would collapse to 1). RGB band writes saturate-cast exactly
-    // as the previous f64→u8 read did.
-    let mut warped = if use_colormap {
-        mem_driver
-            .create_with_band_type::<f64, _>(
-                "",
-                tile_size as usize,
-                tile_size as usize,
-                output_bands,
-            )
-            .map_err(|e| TileServerError::RasterError(format!("Failed to create output: {}", e)))?
-    } else {
-        mem_driver
-            .create_with_band_type::<u8, _>(
-                "",
-                tile_size as usize,
-                tile_size as usize,
-                output_bands,
-            )
-            .map_err(|e| TileServerError::RasterError(format!("Failed to create output: {}", e)))?
+/// Band layout of the MEM warp destination.
+#[derive(Debug, Clone, Copy)]
+enum BandLayout<'a> {
+    /// One source band and a colormap: one f64 band, colored by lookup.
+    Colormap(&'a ColorMapConfig),
+    /// Three or more source bands: R, G, B plus a destination alpha band
+    /// that the warp kernel maintains (`gdalwarp -dstalpha`). A source alpha
+    /// band feeds the density; without one every valid pixel is dense. Areas
+    /// outside the source stay transparent, as in rio-tiler/TiTiler.
+    RgbAlpha,
+    /// One or two source bands without a colormap: gray or R,G, forced
+    /// fully opaque.
+    Plain(usize),
+}
+
+impl<'a> BandLayout<'a> {
+    fn new(band_count: usize, colormap: Option<&'a ColorMapConfig>) -> Self {
+        match colormap {
+            Some(cmap) if band_count == 1 => Self::Colormap(cmap),
+            _ if band_count >= 3 => Self::RgbAlpha,
+            _ => Self::Plain(band_count.min(4)),
+        }
+    }
+
+    fn output_bands(self) -> usize {
+        match self {
+            Self::Colormap(_) => 1,
+            Self::RgbAlpha => 4,
+            Self::Plain(bands) => bands,
+        }
+    }
+}
+
+/// The EPSG:3857 MEM dataset covering `bounds` that the warp writes into.
+fn warp_destination(layout: BandLayout<'_>, bounds: [f64; 4], tile_size: u32) -> Result<Dataset> {
+    let raster_err = |what: &str, e: gdal::errors::GdalError| {
+        TileServerError::RasterError(format!("failed to {what}: {e}"))
     };
-
-    let pixel_size_x = (maxx - minx) / tile_size as f64;
-    let pixel_size_y = (maxy - miny) / tile_size as f64;
-    let geo_transform = [minx, pixel_size_x, 0.0, maxy, 0.0, -pixel_size_y];
-
+    let web_mercator =
+        SpatialRef::from_epsg(3857).map_err(|e| raster_err("create EPSG:3857", e))?;
+    let mem_driver =
+        DriverManager::get_driver_by_name("MEM").map_err(|e| raster_err("get MEM driver", e))?;
+    let size = tile_size as usize;
+    let bands = layout.output_bands();
+    // Byte-typed unless colormapped, so the warp kernel writes byte-range
+    // alpha (for non-Byte alpha bands it writes 0..1 densities, which a u8
+    // read would collapse to 1).
+    let mut warped = match layout {
+        BandLayout::Colormap(_) => {
+            mem_driver.create_with_band_type::<f64, _>("", size, size, bands)
+        }
+        _ => mem_driver.create_with_band_type::<u8, _>("", size, size, bands),
+    }
+    .map_err(|e| raster_err("create output", e))?;
+    let [minx, miny, maxx, maxy] = bounds;
+    let pixel_x = (maxx - minx) / f64::from(tile_size);
+    let pixel_y = (maxy - miny) / f64::from(tile_size);
     warped
-        .set_geo_transform(&geo_transform)
-        .map_err(|e| TileServerError::RasterError(format!("Failed to set geotransform: {}", e)))?;
+        .set_geo_transform(&[minx, pixel_x, 0.0, maxy, 0.0, -pixel_y])
+        .map_err(|e| raster_err("set geotransform", e))?;
     warped
         .set_spatial_ref(&web_mercator)
-        .map_err(|e| TileServerError::RasterError(format!("Failed to set SRS: {}", e)))?;
-
-    if rgb_with_alpha {
-        // CRITICAL: mark the destination's last band as the alpha band
-        // BEFORE warping. GDALReprojectImage maps only
-        // min(src_bands, dst_bands) NON-ALPHA bands 1:1 (gdalwarper.cpp:
-        // source/destination bands whose color interpretation is
-        // GCI_AlphaBand are excluded from the count and handled by the
-        // warp kernel as density). Without this marker a 4-band RGBA
-        // source maps RGB only and the destination alpha stays at its
-        // MEM init value 0 — fully transparent tiles (the bug this
-        // fixes).
+        .map_err(|e| raster_err("set SRS", e))?;
+    if matches!(layout, BandLayout::RgbAlpha) {
+        // CRITICAL: mark the last band as alpha BEFORE warping.
+        // GDALReprojectImage maps only min(src, dst) NON-alpha bands 1:1 and
+        // treats GCI_AlphaBand bands as density. Without this marker a 4-band
+        // RGBA source maps RGB only and alpha stays at its MEM init value 0:
+        // fully transparent tiles.
         warped
-            .rasterband(output_bands)
+            .rasterband(bands)
             .and_then(|mut band| band.set_color_interpretation(ColorInterpretation::AlphaBand))
-            .map_err(|e| {
-                TileServerError::RasterError(format!("Failed to mark dst alpha band: {}", e))
-            })?;
+            .map_err(|e| raster_err("mark dst alpha band", e))?;
     }
+    Ok(warped)
+}
 
-    crate::sources::warp::reproject(dataset, &warped, resampling)?;
+/// Band 1 through the colormap.
+fn colormap_image(
+    warped: &Dataset,
+    tile_size: u32,
+    cmap: &ColorMapConfig,
+    resampling: ResamplingMethod,
+) -> Result<RgbaImage> {
+    let size = tile_size as usize;
+    let band = warped
+        .rasterband(1)
+        .map_err(|e| TileServerError::RasterError(format!("failed to get band: {e}")))?;
+    let buffer: Buffer<f64> = band
+        .read_as::<f64>(
+            (0, 0),
+            (size, size),
+            (size, size),
+            Some(ResampleAlg::from(resampling)),
+        )
+        .map_err(|e| TileServerError::RasterError(format!("failed to read band: {e}")))?;
+    let data = buffer.data();
+    Ok(ImageBuffer::from_fn(tile_size, tile_size, |x, y| {
+        image::Rgba(cmap.get_color(data[(y * tile_size + x) as usize]))
+    }))
+}
 
+/// Bands `1..=bands` into the R, G, B, A channels; missing channels stay 0.
+fn bands_image(
+    warped: &Dataset,
+    bands: usize,
+    tile_size: u32,
+    resampling: ResamplingMethod,
+) -> Result<RgbaImage> {
+    let size = tile_size as usize;
     let mut img: RgbaImage = ImageBuffer::new(tile_size, tile_size);
-
-    if use_colormap {
-        let cmap = colormap.expect("colormap verified by use_colormap flag");
-        let band = warped
-            .rasterband(1)
-            .map_err(|e| TileServerError::RasterError(format!("Failed to get band: {}", e)))?;
-
-        let buffer: Buffer<f64> = band
-            .read_as::<f64>(
+    for band_idx in 1..=bands.min(4) {
+        let band = warped.rasterband(band_idx).map_err(|e| {
+            TileServerError::RasterError(format!("failed to get band {band_idx}: {e}"))
+        })?;
+        let buffer: Buffer<u8> = band
+            .read_as::<u8>(
                 (0, 0),
-                (tile_size as usize, tile_size as usize),
-                (tile_size as usize, tile_size as usize),
+                (size, size),
+                (size, size),
                 Some(ResampleAlg::from(resampling)),
             )
-            .map_err(|e| TileServerError::RasterError(format!("Failed to read band: {}", e)))?;
-
-        let data = buffer.data();
-
-        for (i, &value) in data.iter().enumerate() {
-            let px = (i % tile_size as usize) as u32;
-            let py = (i / tile_size as usize) as u32;
-            let color = cmap.get_color(value);
-            img.put_pixel(px, py, image::Rgba(color));
-        }
-    } else {
-        for band_idx in 1..=output_bands {
-            let band = warped.rasterband(band_idx).map_err(|e| {
-                TileServerError::RasterError(format!("Failed to get band {}: {}", band_idx, e))
-            })?;
-
-            let buffer: Buffer<u8> = band
-                .read_as::<u8>(
-                    (0, 0),
-                    (tile_size as usize, tile_size as usize),
-                    (tile_size as usize, tile_size as usize),
-                    Some(ResampleAlg::from(resampling)),
-                )
-                .map_err(|e| TileServerError::RasterError(format!("Failed to read band: {}", e)))?;
-
-            let data = buffer.data();
-
-            for (i, &value) in data.iter().enumerate() {
-                let px = (i % tile_size as usize) as u32;
-                let py = (i / tile_size as usize) as u32;
-                let pixel = img.get_pixel_mut(px, py);
-
-                match band_idx {
-                    1 => pixel[0] = value,
-                    2 => pixel[1] = value,
-                    3 => pixel[2] = value,
-                    4 => pixel[3] = value,
-                    _ => {}
-                }
-            }
-        }
-
-        match output_bands {
-            1 => {
-                for pixel in img.pixels_mut() {
-                    let gray = pixel[0];
-                    pixel[1] = gray;
-                    pixel[2] = gray;
-                    pixel[3] = 255;
-                }
-            }
-            // Legacy 2-band layout (R, G): no alpha band exists — force
-            // fully opaque so the tile is at least visible.
-            2 => {
-                for pixel in img.pixels_mut() {
-                    pixel[3] = 255;
-                }
-            }
-            // 4 bands: the destination alpha band was maintained by the
-            // warp kernel from source validity — do not touch it.
-            _ => {}
+            .map_err(|e| TileServerError::RasterError(format!("failed to read band: {e}")))?;
+        for (pixel, &value) in img.pixels_mut().zip(buffer.data()) {
+            pixel[band_idx - 1] = value;
         }
     }
+    Ok(img)
+}
 
-    let mut png_data = Vec::new();
-    let mut cursor = Cursor::new(&mut png_data);
-    img.write_to(&mut cursor, image::ImageFormat::Png)
-        .map_err(|e| TileServerError::RasterError(format!("Failed to encode PNG: {}", e)))?;
-
-    Ok(png_data)
+/// Gray (1 band) spreads to RGB; 1 and 2 band layouts have no alpha band,
+/// so they become fully opaque.
+fn make_opaque(img: &mut RgbaImage, bands: usize) {
+    for pixel in img.pixels_mut() {
+        if bands == 1 {
+            pixel[1] = pixel[0];
+            pixel[2] = pixel[0];
+        }
+        pixel[3] = 255;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn band_layout_picks_colormap_rgba_or_plain() {
+        let cmap: ColorMapConfig =
+            toml::from_str("entries = [{ value = 0.0, color = \"#000000\" }]").unwrap();
+        assert!(matches!(
+            BandLayout::new(1, Some(&cmap)),
+            BandLayout::Colormap(_)
+        ));
+        assert!(matches!(
+            BandLayout::new(3, Some(&cmap)),
+            BandLayout::RgbAlpha
+        ));
+        assert!(matches!(BandLayout::new(4, None), BandLayout::RgbAlpha));
+        assert!(matches!(BandLayout::new(2, None), BandLayout::Plain(2)));
+        assert_eq!(BandLayout::new(1, Some(&cmap)).output_bands(), 1);
+        assert_eq!(BandLayout::new(5, None).output_bands(), 4);
+        assert_eq!(BandLayout::new(1, None).output_bands(), 1);
+    }
+
+    #[test]
+    fn make_opaque_spreads_gray_and_keeps_two_band_rg() {
+        let mut gray: RgbaImage = ImageBuffer::from_pixel(1, 1, image::Rgba([9, 0, 0, 0]));
+        make_opaque(&mut gray, 1);
+        assert_eq!(gray.get_pixel(0, 0).0, [9, 9, 9, 255]);
+        let mut rg: RgbaImage = ImageBuffer::from_pixel(1, 1, image::Rgba([1, 2, 0, 0]));
+        make_opaque(&mut rg, 2);
+        assert_eq!(rg.get_pixel(0, 0).0, [1, 2, 0, 255]);
+    }
 
     #[test]
     fn test_tile_to_web_mercator_bbox() {
@@ -633,6 +664,32 @@ mod tests {
         assert!((maxy - WEB_MERCATOR_EXTENT).abs() < 1e-6);
         assert!((maxx - 0.0).abs() < 1e-6);
         assert!((miny - 0.0).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn from_file_rejects_a_raster_without_spatial_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no-srs.tif");
+        {
+            let driver = DriverManager::get_driver_by_name("GTiff").unwrap();
+            let mut ds = driver
+                .create_with_band_type::<u8, _>(&path, 8, 8, 1)
+                .unwrap();
+            ds.set_geo_transform(&TEST_GT_FULL).unwrap();
+        }
+        let config: SourceConfig = toml::from_str(&format!(
+            "id = \"no-srs\"\ntype = \"cog\"\npath = \"{}\"",
+            path.display()
+        ))
+        .unwrap();
+        let err = CogSource::from_file(&config)
+            .await
+            .err()
+            .expect("a raster without a CRS has no WGS84 bounds");
+        assert!(
+            err.to_string().to_lowercase().contains("spatial reference"),
+            "{err}"
+        );
     }
 
     // ---- RGBA/RGB tile rendering (warp-maintained destination alpha) ----
@@ -813,27 +870,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn render_returns_error_when_warp_fails() {
-        let ds = crate::sources::warp::tests::untransformable_source();
-        let err = render_tile_from_dataset(
-            &ds,
-            -WEB_MERCATOR_EXTENT,
-            -WEB_MERCATOR_EXTENT,
-            WEB_MERCATOR_EXTENT,
-            WEB_MERCATOR_EXTENT,
-            256,
-            1,
-            ResamplingMethod::Nearest,
-            None,
-        )
-        .unwrap_err();
-        assert!(
-            matches!(&err, TileServerError::RasterError(m) if m.contains("GDALReprojectImage")),
-            "warp failure is surfaced, got {err:?}"
-        );
-    }
-
     // ---- Overview-path get_tile (the `{path}#ovr{n}` cache branch) ----
 
     /// Write a real on-disk RGB GeoTIFF (EPSG:3857, uint8) that has **built
@@ -908,7 +944,8 @@ mod tests {
             dynamic: false,
             max_items: 500,
             max_total_items: 64,
-            mosaic_max_assets: 8,            stac_bbox: None,
+            mosaic_max_assets: 8,
+            stac_bbox: None,
             pixel_selection: crate::config::PixelSelectionMethod::First,
             tile_path_template: None,
             tms: false,
@@ -960,4 +997,26 @@ mod tests {
             "z0 render must go through the `{{path}}#ovr{{n}}` pool, but no overview key was cached"
         );
     }
+
+    #[test]
+    fn render_returns_error_when_warp_fails() {
+        let ds = crate::sources::warp::tests::untransformable_source();
+        let err = render_tile_from_dataset(
+            &ds,
+            -WEB_MERCATOR_EXTENT,
+            -WEB_MERCATOR_EXTENT,
+            WEB_MERCATOR_EXTENT,
+            WEB_MERCATOR_EXTENT,
+            256,
+            1,
+            ResamplingMethod::Nearest,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, TileServerError::RasterError(m) if m.contains("GDALReprojectImage")),
+            "warp failure is surfaced, got {err:?}"
+        );
+    }
+
 }

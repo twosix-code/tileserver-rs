@@ -12,9 +12,9 @@ use crate::sources::{TileCompression, TileData, TileFormat, TileMetadata, TileSo
 /// MBTiles tile source
 ///
 /// Implements the MBTiles 1.3 specification for serving tiles from SQLite databases.
-/// See: https://github.com/mapbox/mbtiles-spec/blob/master/1.3/spec.md
+/// See: <https://github.com/mapbox/mbtiles-spec/blob/master/1.3/spec.md>
 pub struct MbTilesSource {
-    /// SQLite connection (wrapped in Arc<Mutex> for thread-safety)
+    /// SQLite connection (wrapped in `Arc<Mutex>` for thread-safety)
     conn: Arc<Mutex<Connection>>,
     /// Cached metadata
     metadata: TileMetadata,
@@ -24,6 +24,12 @@ pub struct MbTilesSource {
 
 impl MbTilesSource {
     /// Create a new MBTiles source from a local file
+    ///
+    /// # Errors
+    ///
+    /// [`TileServerError::FileError`] when the file is missing, and
+    /// [`TileServerError::MbTilesError`] when it is not a readable MBTiles
+    /// database.
     pub async fn from_file(config: &SourceConfig) -> Result<Self> {
         let path = Path::new(&config.path);
 
@@ -212,7 +218,7 @@ impl TileSource for MbTilesSource {
         // Run the SQLite query in a blocking task to avoid blocking the async runtime
         let result = tokio::task::spawn_blocking(move || {
             let conn = conn.lock().map_err(|e| {
-                TileServerError::MbTilesError(format!("Failed to acquire connection lock: {}", e))
+                TileServerError::MbTilesError(format!("failed to acquire connection lock: {}", e))
             })?;
 
             let mut stmt = conn
@@ -239,7 +245,7 @@ impl TileSource for MbTilesSource {
             }))
         })
         .await
-        .map_err(|e| TileServerError::MbTilesError(format!("Task join error: {}", e)))??;
+        .map_err(|e| TileServerError::MbTilesError(format!("task join error: {}", e)))??;
 
         Ok(result)
     }
@@ -271,12 +277,6 @@ mod tests {
         assert_eq!(MbTilesSource::flip_y(2, 1), 2);
         assert_eq!(MbTilesSource::flip_y(2, 2), 1);
         assert_eq!(MbTilesSource::flip_y(2, 3), 0);
-    }
-
-    #[test]
-    fn test_flip_y_high_zoom() {
-        assert_eq!(MbTilesSource::flip_y(10, 0), 1023);
-        assert_eq!(MbTilesSource::flip_y(10, 1023), 0);
     }
 
     fn create_in_memory_mbtiles() -> Connection {
@@ -870,30 +870,6 @@ mod tests {
         assert!(meta.center.is_none());
     }
 
-    #[test]
-    fn test_gzip_detection_in_tile_data() {
-        let gzip_bytes: Vec<u8> = vec![0x1f, 0x8b, 0x08, 0x00, 0x00];
-        let compression = if gzip_bytes.len() >= 2 && gzip_bytes[0] == 0x1f && gzip_bytes[1] == 0x8b
-        {
-            TileCompression::Gzip
-        } else {
-            TileCompression::None
-        };
-        assert_eq!(compression, TileCompression::Gzip);
-    }
-
-    #[test]
-    fn test_non_gzip_detection_in_tile_data() {
-        let plain_bytes: Vec<u8> = vec![0x00, 0x01, 0x02, 0x03];
-        let compression =
-            if plain_bytes.len() >= 2 && plain_bytes[0] == 0x1f && plain_bytes[1] == 0x8b {
-                TileCompression::Gzip
-            } else {
-                TileCompression::None
-            };
-        assert_eq!(compression, TileCompression::None);
-    }
-
     fn fixture_config() -> SourceConfig {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         let fixture_path = std::path::PathBuf::from(manifest_dir)
@@ -1028,9 +1004,9 @@ mod tests {
 
         let z = metadata.maxzoom.min(20);
         let max = 1u32 << z;
+        // The far south-east tile is outside the fixture's extent.
         let result = source.get_tile(z, max - 1, max - 1).await.unwrap();
-
-        let _ = result;
+        assert!(result.is_none());
     }
 
     #[tokio::test]

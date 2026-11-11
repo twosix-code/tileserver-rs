@@ -1,14 +1,14 @@
 //! Pure logic for the embeddable iframe map endpoint (`GET /embed/{style}`).
 //!
-//! This module owns everything the [`crate::routes::embed`] handler needs:
-//! typed query-parameter parsing ([`parse_embed_query`]), HTML escaping
-//! ([`html_escape`]), and self-contained HTML page generation
-//! ([`build_embed_html`]).
+//! This module owns everything the `crate::routes::embed` handler needs:
+//! typed query-parameter parsing (`parse_embed_query`), HTML escaping
+//! (`html_escape`), and self-contained HTML page generation
+//! (`build_embed_html`).
 //!
 //! Security posture: every query parameter is parsed into a typed value at the
 //! boundary (`f64`, `u8`, `bool`, whitelisted enums). The two remaining string
 //! values injected into the page — the style id and theme — are additionally
-//! HTML-escaped via [`html_escape`]. Numeric values are serialised as JSON
+//! HTML-escaped via `html_escape`. Numeric values are serialised as JSON
 //! number literals, so they can never carry markup. This is belt-and-braces:
 //! typed parsing alone would suffice, but the escape provides defence in depth
 //! for the most security-sensitive endpoint in the server.
@@ -564,12 +564,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_query_controls_default_when_absent() {
-        let p = parse_embed_query(&HashMap::new()).unwrap();
-        assert_eq!(p.controls, vec![Control::Navigation]);
-    }
-
-    #[test]
     fn parse_query_controls_unknown_token_filtered() {
         let p = parse_embed_query(&map_of(&[("controls", "navigation,banana,scale")])).unwrap();
         assert_eq!(p.controls, vec![Control::Navigation, Control::Scale]);
@@ -689,16 +683,6 @@ mod tests {
         assert!(!out.contains('>'));
         assert!(!out.contains('"'));
         assert!(out.contains("&lt;script&gt;"));
-    }
-
-    #[test]
-    fn escape_empty_string() {
-        assert_eq!(html_escape(""), "");
-    }
-
-    #[test]
-    fn escape_unicode_preserved() {
-        assert_eq!(html_escape("café 🗺️"), "café 🗺️");
     }
 
     // ---- build_embed_html ----

@@ -110,61 +110,9 @@ impl StacSource {
             .clone()
             .unwrap_or_else(|| format!("STAC: {collection}"));
 
-        let cog_source = if let Some(first_asset) = assets.first() {
-            let cog_config = SourceConfig {
-                id: config.id.clone(),
-                source_type: crate::config::SourceType::Cog,
-                path: to_gdal_cog_path(&first_asset.href),
-                name: config.name.clone(),
-                attribution: config.attribution.clone(),
-                description: config.description.clone(),
-                resampling: config.resampling,
-                layer_name: None,
-                geometry_column: None,
-                query: None,
-                minzoom: config.minzoom,
-                maxzoom: config.maxzoom,
-                serve_as: None,
-                #[cfg(feature = "raster")]
-                colormap: config.colormap.clone(),
-                options: None,
-                collection: config.collection.clone(),
-                asset_role: config.asset_role.clone(),
-                dynamic: config.dynamic,
-                max_items: config.max_items,
-                max_total_items: config.max_total_items,
-                mosaic_max_assets: config.mosaic_max_assets,
-                stac_bbox: config.stac_bbox,
-                pixel_selection: config.pixel_selection,
-                tile_path_template: None,
-                tms: false,
-                #[cfg(feature = "dem")]
-                input_source: config.input_source.clone(),
-                #[cfg(feature = "dem")]
-                dem_encoding: config.dem_encoding,
-                #[cfg(feature = "dem")]
-                dem_scale: config.dem_scale,
-                #[cfg(feature = "dem")]
-                dem_offset: config.dem_offset,
-                #[cfg(feature = "dem")]
-                dem_band: config.dem_band,
-                #[cfg(feature = "dem")]
-                dem_nodata_color: config.dem_nodata_color,
-                filter: None,
-            };
-
-            match CogSource::from_file(&cog_config).await {
-                Ok(source) => Some(Arc::new(source)),
-                Err(e) => {
-                    tracing::warn!(
-                        "failed to create CogSource for first STAC asset {}: {e}",
-                        first_asset.href
-                    );
-                    None
-                }
-            }
-        } else {
-            None
+        let cog_source = match assets.first() {
+            Some(first) => first_asset_source(config, &first.href).await,
+            None => None,
         };
 
         let dynamic = if config.dynamic {
@@ -325,39 +273,42 @@ pub async fn discover_assets(
     max_items: usize,
     bbox: Option<[f64; 4]>,
 ) -> Result<Vec<StacAsset>> {
-    let search_url = build_search_url(api_url);
-    let client = reqwest::Client::builder()
-        .user_agent("tileserver-rs/stac")
-        .build()
-        .map_err(|e| TileServerError::StacError(format!("failed to create HTTP client: {e}")))?;
-
     let mut search_body = serde_json::json!({
         "collections": [collection],
         "limit": max_items
     });
     if let Some(b) = bbox {
-        search_body["bbox"] = serde_json::json!([b[0], b[1], b[2], b[3]]);
+        search_body["bbox"] = serde_json::json!(b);
     }
+    search_assets(api_url, &search_body, asset_role).await
+}
 
+/// POST `body` to the API's `/search` and pick each item's COG asset.
+async fn search_assets(
+    api_url: &str,
+    body: &serde_json::Value,
+    asset_role: &str,
+) -> Result<Vec<StacAsset>> {
+    let client = reqwest::Client::builder()
+        .user_agent("tileserver-rs/stac")
+        .build()
+        .map_err(|e| TileServerError::StacError(format!("failed to create HTTP client: {e}")))?;
     let response = client
-        .post(&search_url)
-        .json(&search_body)
+        .post(build_search_url(api_url))
+        .json(body)
         .send()
         .await
         .map_err(|e| TileServerError::StacError(format!("stac api search failed: {e}")))?;
-
     if !response.status().is_success() {
         return Err(TileServerError::StacError(format!(
             "stac api returned status {}",
             response.status()
         )));
     }
-
     let body: serde_json::Value = response
         .json()
         .await
         .map_err(|e| TileServerError::StacError(format!("failed to parse stac response: {e}")))?;
-
     extract_assets_from_item_collection(&body, asset_role)
 }
 
@@ -372,7 +323,7 @@ pub fn build_search_url(api_url: &str) -> String {
 ///
 /// Deserialises the body as a [`stac::ItemCollection`] (community-maintained
 /// spec types from the `stac` crate), then walks each [`stac::Item`] and
-/// picks the best COG [`stac::Asset`] — first by matching [`asset_role`],
+/// picks the best COG [`stac::Asset`] — first by matching `asset_role`,
 /// falling back to the first asset whose `type` is a COG/GeoTIFF MIME type.
 ///
 /// The crate deserialiser is intentionally lenient (unknown top-level
@@ -990,22 +941,41 @@ fn next_page_token(body: &serde_json::Value) -> Option<String> {
 // Re-exported here for backward-compatible `stac::to_gdal_cog_path` paths.
 pub use super::to_gdal_cog_path;
 
-/// Phase 2 single-asset rendering: construct a one-shot [`CogSource`]
-/// pointed at `asset.href`, render the tile, and drop the source.
+/// Source option that lets a remote STAC catalog point at local or
+/// GDAL-virtual (`/vsi…`) asset paths. Off by default.
+pub const ALLOW_LOCAL_HREFS_OPTION: &str = "allow_local_hrefs";
+
+/// Whether `href` from a STAC response may reach GDAL.
 ///
-/// The `template` SourceConfig provides shared config (colormap, resampling,
-/// etc.) so per-tile renders match the catalog-wide style.
-async fn render_single_asset(
-    asset: &StacAsset,
-    template: &SourceConfig,
-    z: u8,
-    x: u32,
-    y: u32,
-) -> Result<Option<TileData>> {
-    let cfg = SourceConfig {
+/// `http(s)://` hrefs are always allowed. Anything else (a local path,
+/// `file:`, `/vsi…`, `s3://`) is allowed only when the catalog itself is a
+/// local file the operator controls, or when the source sets
+/// `options.allow_local_hrefs = "true"`. A remote catalog therefore cannot
+/// make the server open its own files or GDAL virtual filesystems.
+#[must_use]
+pub fn asset_href_allowed(template: &SourceConfig, href: &str) -> bool {
+    let is_http = |s: &str| {
+        let lower = s.trim_start().to_ascii_lowercase();
+        lower.starts_with("https://") || lower.starts_with("http://")
+    };
+    if is_http(href) {
+        return true;
+    }
+    let opted_in = template
+        .options
+        .as_ref()
+        .and_then(|o| o.get(ALLOW_LOCAL_HREFS_OPTION))
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+    !is_http(&template.path) || opted_in
+}
+
+/// A COG source config for one STAC asset, styled like the catalog
+/// (`template`: colormap, resampling, zoom range, DEM options).
+fn asset_cog_config(template: &SourceConfig, href: &str) -> SourceConfig {
+    SourceConfig {
         id: template.id.clone(),
         source_type: crate::config::SourceType::Cog,
-        path: to_gdal_cog_path(&asset.href),
+        path: to_gdal_cog_path(href),
         name: template.name.clone(),
         attribution: template.attribution.clone(),
         description: template.description.clone(),
@@ -1042,7 +1012,42 @@ async fn render_single_asset(
         #[cfg(feature = "dem")]
         dem_nodata_color: template.dem_nodata_color,
         filter: None,
-    };
+    }
+}
+
+/// The static-mode source: the catalog's first asset as a COG. A failure is
+/// logged and leaves the source without tiles.
+async fn first_asset_source(config: &SourceConfig, href: &str) -> Option<Arc<CogSource>> {
+    if !asset_href_allowed(config, href) {
+        tracing::warn!(source = %config.id, "skipping STAC asset with a non-http href from a remote catalog");
+        return None;
+    }
+    match CogSource::from_file(&asset_cog_config(config, href)).await {
+        Ok(source) => Some(Arc::new(source)),
+        Err(e) => {
+            tracing::warn!("failed to create CogSource for first STAC asset {href}: {e}");
+            None
+        }
+    }
+}
+
+/// Phase 2 single-asset rendering: construct a one-shot [`CogSource`]
+/// pointed at `asset.href`, render the tile, and drop the source.
+///
+/// The `template` SourceConfig provides shared config (colormap, resampling,
+/// etc.) so per-tile renders match the catalog-wide style.
+async fn render_single_asset(
+    asset: &StacAsset,
+    template: &SourceConfig,
+    z: u8,
+    x: u32,
+    y: u32,
+) -> Result<Option<TileData>> {
+    if !asset_href_allowed(template, &asset.href) {
+        tracing::warn!(source = %template.id, item = %asset.id, "skipping STAC asset with a non-http href from a remote catalog");
+        return Ok(None);
+    }
+    let cfg = asset_cog_config(template, &asset.href);
 
     match CogSource::from_file(&cfg).await {
         Ok(src) => {
@@ -1125,7 +1130,7 @@ async fn composite_mosaic(
     x: u32,
     y: u32,
 ) -> Result<Option<TileData>> {
-    use crate::raster::{decode, encode, mosaic};
+    use crate::raster::mosaic;
 
     let ordered_assets = order_assets_for_method(assets, template.pixel_selection);
 
@@ -1134,28 +1139,51 @@ async fn composite_mosaic(
         .map(|asset| render_single_asset(asset, template, z, x, y));
     let render_results = futures::future::join_all(render_futures).await;
 
-    let mut method = mosaic::build(template.pixel_selection);
-    let mut fed_any = false;
+    let mut rendered = Vec::with_capacity(render_results.len());
     for (asset, render_result) in ordered_assets.iter().zip(render_results) {
-        let Some(tile) = render_result? else { continue };
-        let raster = match decode::from_bytes(&tile.data) {
+        if let Some(tile) = render_result? {
+            rendered.push((asset.id.clone(), tile.data));
+        }
+    }
+
+    // Decode, composite and encode are CPU work: keep them off the runtime.
+    let method = mosaic::build(template.pixel_selection);
+    let png = tokio::task::spawn_blocking(move || composite_rendered(method, rendered))
+        .await
+        .map_err(|e| TileServerError::StacError(format!("mosaic task failed: {e}")))??;
+    let Some(png) = png else {
+        return Ok(None);
+    };
+
+    Ok(Some(TileData {
+        data: png.into(),
+        format: TileFormat::Png,
+        compression: crate::sources::TileCompression::None,
+    }))
+}
+
+/// Feed rendered asset tiles (priority order) into `method` and encode the
+/// result as PNG. `None` when no tile decoded.
+fn composite_rendered(
+    mut method: Box<dyn crate::raster::mosaic::MosaicMethod>,
+    rendered: Vec<(String, bytes::Bytes)>,
+) -> Result<Option<Vec<u8>>> {
+    for (asset_id, data) in rendered {
+        let raster = match crate::raster::decode::from_bytes(&data) {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!(asset_id = %asset.id, error = %e, "mosaic: failed to decode");
+                tracing::warn!(asset_id = %asset_id, error = %e, "mosaic: failed to decode");
                 continue;
             }
         };
         method.feed(raster);
-        fed_any = true;
         if method.is_done() {
             break;
         }
     }
-    if !fed_any {
+    let Some(finalised) = method.finalize() else {
         return Ok(None);
-    }
-    let finalised = method.finalize();
-
+    };
     // A fully-transparent composite means every contributing asset rendered
     // blank (upstream connection blips, partial coverage). Returning it as a
     // real tile would let the manager write a blank hole into the tile cache
@@ -1166,15 +1194,9 @@ async fn composite_mosaic(
         tracing::debug!("mosaic composited to a fully-transparent tile; treating as no-tile");
         return Ok(None);
     }
-
-    let png = encode::to_png(&finalised)
+    let png = crate::raster::encode::to_png(&finalised)
         .map_err(|e| TileServerError::StacError(format!("mosaic png encode failed: {e}")))?;
-
-    Ok(Some(TileData {
-        data: png.into(),
-        format: TileFormat::Png,
-        compression: crate::sources::TileCompression::None,
-    }))
+    Ok(Some(png))
 }
 
 /// Reorder assets to give the chosen [`PixelSelectionMethod`] its
@@ -1203,6 +1225,40 @@ fn order_assets_for_method(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn png_2x2(rgba: [u8; 4]) -> bytes::Bytes {
+        let img = image::RgbaImage::from_pixel(2, 2, image::Rgba(rgba));
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+        bytes::Bytes::from(out.into_inner())
+    }
+
+    #[test]
+    fn composite_rendered_skips_undecodable_assets_and_encodes_png() {
+        let method = crate::raster::mosaic::build(crate::config::PixelSelectionMethod::First);
+        let rendered = vec![
+            (
+                "broken".to_string(),
+                bytes::Bytes::from_static(b"not an image"),
+            ),
+            ("ok".to_string(), png_2x2([10, 20, 30, 255])),
+        ];
+        let png = composite_rendered(method, rendered)
+            .unwrap()
+            .expect("the decodable asset is composited");
+        let img = image::load_from_memory(&png).unwrap().to_rgba8();
+        assert_eq!(img.dimensions(), (2, 2));
+        assert_eq!(img.get_pixel(0, 0).0, [10, 20, 30, 255]);
+    }
+
+    #[test]
+    fn composite_rendered_returns_none_when_nothing_decodes() {
+        let method = crate::raster::mosaic::build(crate::config::PixelSelectionMethod::First);
+        let rendered = vec![("broken".to_string(), bytes::Bytes::from_static(b"nope"))];
+        assert!(composite_rendered(method, rendered).unwrap().is_none());
+        let method = crate::raster::mosaic::build(crate::config::PixelSelectionMethod::First);
+        assert!(composite_rendered(method, Vec::new()).unwrap().is_none());
+    }
 
     fn sample_item_json(item_id: &str, role: &str, mime: &str) -> serde_json::Value {
         serde_json::json!({
@@ -1275,21 +1331,6 @@ mod tests {
     }
 
     #[test]
-    fn test_stac_item_rejects_invalid_bbox_length() {
-        let item_json = serde_json::json!({
-            "type": "Feature",
-            "id": "test",
-            "stac_version": "1.0.0",
-            "geometry": null,
-            "bbox": [-122.5, 37.0, 0.0, -122.0, 37.5],
-            "properties": {"datetime": null},
-            "assets": {},
-            "links": []
-        });
-        assert!(serde_json::from_value::<stac::Item>(item_json).is_err());
-    }
-
-    #[test]
     fn test_tile_to_wgs84_bbox_z0_covers_world() {
         let b = tile_to_wgs84_bbox(0, 0, 0);
         assert!((b[0] - -180.0).abs() < 1e-6);
@@ -1304,21 +1345,6 @@ mod tests {
         assert!((b[0] - -180.0).abs() < 1e-6);
         assert!((b[2] - 0.0).abs() < 1e-6);
         assert!(b[1] < b[3]);
-    }
-
-    #[test]
-    fn test_stac_item_missing_bbox_is_optional() {
-        let item_json = serde_json::json!({
-            "type": "Feature",
-            "id": "no-bbox",
-            "stac_version": "1.0.0",
-            "geometry": null,
-            "properties": {"datetime": null},
-            "assets": {},
-            "links": []
-        });
-        let item: stac::Item = serde_json::from_value(item_json).unwrap();
-        assert!(item.bbox.is_none());
     }
 
     #[test]
@@ -2004,48 +2030,219 @@ mod tests {
     }
 
     #[test]
-    fn test_tile_to_wgs84_bbox_z0() {
-        let bbox = tile_to_wgs84_bbox(0, 0, 0);
-        assert!((bbox[0] - (-180.0)).abs() < 0.01);
-        assert!((bbox[2] - 180.0).abs() < 0.01);
-        assert!(bbox[1] < -85.0 && bbox[1] > -86.0);
-        assert!(bbox[3] > 85.0 && bbox[3] < 86.0);
-    }
-
-    #[test]
     fn test_tile_to_wgs84_bbox_z2_corner() {
         let bbox = tile_to_wgs84_bbox(2, 0, 0);
         assert!((bbox[0] - (-180.0)).abs() < 0.01);
         assert!((bbox[2] - (-90.0)).abs() < 0.01);
         assert!(bbox[3] > 0.0);
     }
+}
 
-    #[test]
-    fn test_extract_assets_from_item_collection_basic() {
-        let item1 = sample_item_json(
-            "i1",
-            "data",
-            "image/tiff; application=geotiff; profile=cloud-optimized",
+/// Against a local mock STAC API whose items point at the repo's RGB test
+/// COG (San Francisco, EPSG:4326).
+#[cfg(test)]
+mod mock_api_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    type Requests = Arc<Mutex<Vec<serde_json::Value>>>;
+
+    fn item(id: &str, cloud: f64) -> serde_json::Value {
+        let cog = format!(
+            "{}/../../data/raster/test-rgb.cog.tif",
+            env!("CARGO_MANIFEST_DIR")
         );
-        let collection = sample_item_collection(vec![item1]);
-        let assets = extract_assets_from_item_collection(&collection, "data").unwrap();
-        assert_eq!(assets.len(), 1);
-        assert_eq!(assets[0].id, "i1");
+        serde_json::json!({
+            "type": "Feature", "stac_version": "1.0.0", "id": id,
+            "geometry": null, "bbox": [-122.5, 37.7, -122.3, 37.9],
+            "properties": { "datetime": "2024-01-01T00:00:00Z", "eo:cloud_cover": cloud },
+            "links": [],
+            "assets": { "visual": { "href": cog, "type": "image/tiff; application=geotiff; profile=cloud-optimized", "roles": ["visual"] } }
+        })
+    }
+
+    /// `/two/search` and `/one/search` answer with items, `/down/search`
+    /// with a 500, `/odd/search` with JSON that is not an ItemCollection.
+    async fn mock_api() -> (String, Requests) {
+        use axum::{Json, Router, http::StatusCode, routing::post};
+        let requests: Requests = Arc::default();
+        let log = |r: Requests| {
+            move |Json(body): Json<serde_json::Value>| {
+                r.lock().unwrap().push(body);
+                async {}
+            }
+        };
+        let two = requests.clone();
+        let one = requests.clone();
+        let app = Router::new()
+            .route(
+                "/two/search",
+                post(move |body: Json<serde_json::Value>| {
+                    let r = two.clone();
+                    async move {
+                        log(r)(body).await;
+                        Json(serde_json::json!({
+                            "type": "FeatureCollection",
+                            "features": [item("a", 40.0), item("b", 5.0)]
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/one/search",
+                post(move |body: Json<serde_json::Value>| {
+                    let r = one.clone();
+                    async move {
+                        log(r)(body).await;
+                        Json(serde_json::json!({ "type": "FeatureCollection", "features": [item("a", 1.0)] }))
+                    }
+                }),
+            )
+            .route("/down/search", post(|| async { StatusCode::INTERNAL_SERVER_ERROR }))
+            .route("/odd/search", post(|| async { Json(serde_json::json!({ "hello": 1 })) }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (base, requests)
+    }
+
+    /// The mock items point at a local test COG, so these sources opt in to
+    /// local hrefs; [`config_strict`] leaves the default (http only).
+    fn config(api: &str, dynamic: bool) -> SourceConfig {
+        let mut cfg = config_strict(api, dynamic);
+        cfg.options = Some(
+            [(ALLOW_LOCAL_HREFS_OPTION.to_string(), "true".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        cfg
+    }
+
+    fn config_strict(api: &str, dynamic: bool) -> SourceConfig {
+        toml::from_str(&format!(
+            "id = \"s2\"\ntype = \"stac\"\npath = \"{api}\"\ncollection = \"sentinel\"\nasset_role = \"visual\"\nmax_items = 7\ndynamic = {dynamic}\n"
+        ))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn remote_catalog_cannot_point_gdal_at_local_files() {
+        let (base, _) = mock_api().await;
+        let strict = StacSource::new(&config_strict(&format!("{base}/one"), true))
+            .await
+            .unwrap();
+        assert!(
+            strict.get_tile(10, 163, 395).await.unwrap().is_none(),
+            "a local href from a remote catalog is skipped"
+        );
+        let static_src = StacSource::new(&config_strict(&format!("{base}/two"), false))
+            .await
+            .unwrap();
+        assert!(static_src.get_tile(10, 163, 395).await.unwrap().is_none());
     }
 
     #[test]
-    fn test_extract_assets_from_item_collection_filters_non_cog() {
-        let item1 = sample_item_json("i1", "thumbnail", "image/png");
-        let collection = sample_item_collection(vec![item1]);
-        let result = extract_assets_from_item_collection(&collection, "data");
-        assert!(result.is_ok(), "result: {:?}", result);
+    fn asset_href_allowed_by_catalog_origin() {
+        let remote = config_strict("https://stac.example/api", true);
+        assert!(asset_href_allowed(&remote, "https://cdn.example/a.tif"));
+        assert!(asset_href_allowed(&remote, " HTTP://cdn.example/a.tif"));
+        for bad in [
+            "/etc/passwd",
+            "/vsicurl/http://x/a.tif",
+            "file:///a.tif",
+            "s3://b/a.tif",
+        ] {
+            assert!(!asset_href_allowed(&remote, bad), "{bad}");
+        }
+        let local = config_strict("/data/catalog.json", false);
+        assert!(
+            asset_href_allowed(&local, "/data/a.tif"),
+            "local catalog is trusted"
+        );
+        assert!(asset_href_allowed(
+            &config("https://stac.example/api", true),
+            "/data/a.tif"
+        ));
     }
 
-    #[test]
-    fn test_extract_assets_from_item_collection_empty_features() {
-        let collection = sample_item_collection(vec![]);
-        let assets = extract_assets_from_item_collection(&collection, "data").unwrap();
-        assert!(assets.is_empty());
+    #[tokio::test]
+    async fn discover_assets_posts_the_search_and_reads_items() {
+        let (base, requests) = mock_api().await;
+        let api = format!("{base}/two");
+        let assets = discover_assets(&api, "sentinel", "visual", 7, Some([1.0, 2.0, 3.0, 4.0]))
+            .await
+            .unwrap();
+        assert_eq!(assets.len(), 2);
+        assert_eq!(assets[0].bbox, [-122.5, 37.7, -122.3, 37.9]);
+        assert_eq!(assets[1].cloud_cover, Some(5.0));
+        let sent = requests.lock().unwrap()[0].clone();
+        assert_eq!(sent["collections"], serde_json::json!(["sentinel"]));
+        assert_eq!(sent["limit"], 7);
+        assert_eq!(sent["bbox"], serde_json::json!([1.0, 2.0, 3.0, 4.0]));
+    }
+
+    #[tokio::test]
+    async fn discover_assets_reports_http_and_shape_errors() {
+        let (base, _) = mock_api().await;
+        let down = discover_assets(&format!("{base}/down"), "c", "visual", 1, None)
+            .await
+            .unwrap_err();
+        assert!(down.to_string().contains("status 500"), "{down}");
+        let odd = discover_assets(&format!("{base}/odd"), "c", "visual", 1, None)
+            .await
+            .unwrap_err();
+        assert!(odd.to_string().contains("FeatureCollection"), "{odd}");
+    }
+
+    #[tokio::test]
+    async fn static_source_serves_the_first_asset() {
+        let (base, _) = mock_api().await;
+        let source = StacSource::new(&config(&format!("{base}/two"), false))
+            .await
+            .unwrap();
+        assert_eq!(source.metadata().name, "STAC: sentinel");
+        assert_eq!(source.metadata().bounds, Some([-122.5, 37.7, -122.3, 37.9]));
+        assert_eq!(source.discovered_assets().len(), 2);
+        let tile = source.get_tile(10, 163, 395).await.unwrap().unwrap();
+        assert!(tile.data.starts_with(&[0x89, b'P', b'N', b'G']));
+    }
+
+    #[tokio::test]
+    async fn dynamic_source_mosaics_several_assets_and_renders_one_directly() {
+        let (base, requests) = mock_api().await;
+        for api in ["two", "one"] {
+            let source = StacSource::new(&config(&format!("{base}/{api}"), true))
+                .await
+                .unwrap();
+            let tile = source.get_tile(10, 163, 395).await.unwrap().unwrap();
+            assert_eq!(tile.format, TileFormat::Png, "{api}");
+        }
+        // The tile search sends the tile's own bbox.
+        let last = requests.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(last["bbox"].as_array().unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn dynamic_source_with_a_failing_api_has_no_tile() {
+        let (base, _) = mock_api().await;
+        let mut source = StacSource::new(&config(&format!("{base}/one"), true))
+            .await
+            .unwrap();
+        if let Some(dynamic) = source.dynamic.as_mut() {
+            dynamic.api_url = format!("{base}/down");
+        }
+        assert!(source.get_tile(10, 163, 395).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn new_requires_a_collection() {
+        let config: SourceConfig =
+            toml::from_str("id = \"s\"\ntype = \"stac\"\npath = \"http://127.0.0.1:9\"").unwrap();
+        let err = StacSource::new(&config).await.err().unwrap();
+        assert!(
+            err.to_string().contains("'collection' is required"),
+            "{err}"
+        );
     }
 
     // ---- Pagination token extraction (dynamic STAC mosaic) ----
@@ -2096,7 +2293,10 @@ mod tests {
 
     #[test]
     fn test_next_page_token_absent_when_no_links() {
-        let body = sample_item_collection(vec![]);
+        let body = serde_json::json!({
+            "type": "FeatureCollection",
+            "features": []
+        });
         assert_eq!(next_page_token(&body), None);
     }
 

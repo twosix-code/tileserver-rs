@@ -146,6 +146,13 @@ impl SearchCache {
                         completed_at: None,
                     }));
                     map.insert(key.clone(), Arc::clone(&entry));
+                    // The ceiling was enforced *before* this insert, so a map at
+                    // `max_entries` would grow to `max_entries + 1` and stay
+                    // there (every later call re-trims only to the ceiling
+                    // again). Re-check after inserting: the new entry is
+                    // in-flight and therefore never evicted, so this trims the
+                    // oldest *completed* entry instead.
+                    self.expire_locked(&mut map);
                     Role::Leader(entry)
                 }
             }

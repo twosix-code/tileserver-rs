@@ -6,7 +6,7 @@
 //! lon/lat (`OGC:CRS84` and `EPSG:4326`) so downstream SQL always sees a
 //! single canonical SRID (4326).
 //!
-//! Reference: https://docs.ogc.org/is/18-058/18-058.html
+//! Reference: <https://docs.ogc.org/is/18-058/18-058.html>
 
 use crate::error::TileServerError;
 
@@ -51,14 +51,6 @@ impl Crs {
     #[must_use]
     pub(crate) const fn srid(&self) -> i32 {
         self.srid
-    }
-
-    /// URI to emit in links, collection metadata, and the `Content-Crs`
-    /// response header.
-    #[must_use]
-    #[allow(dead_code)] // Public API surface consumed by Part 3 filter-crs and tests.
-    pub(crate) fn uri(&self) -> &str {
-        &self.uri
     }
 
     /// Returns the value for the OGC `Content-Crs` response header, which
@@ -172,17 +164,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_is_crs84_with_srid_4326() {
-        let crs = Crs::crs84();
-        assert_eq!(crs.srid(), 4326);
-        assert_eq!(crs.uri(), CRS84_URI);
-    }
-
-    #[test]
     fn parses_http_epsg_uri() {
         let crs = parse_crs("http://www.opengis.net/def/crs/EPSG/0/25832").unwrap();
         assert_eq!(crs.srid(), 25832);
-        assert!(crs.uri().ends_with("/25832"));
+        assert!(crs.uri.as_str().ends_with("/25832"));
     }
 
     #[test]

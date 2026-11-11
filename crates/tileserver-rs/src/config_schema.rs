@@ -4,11 +4,11 @@
 //! lands in one Rust file plus this file in the same PR — and so the same
 //! catalog drives the operator UI at `/admin/config` without a separate
 //! TypeScript catalog drifting out of sync. Served by
-//! [`crate::admin::config_schema_handler`] at `GET /__admin/config/schema`.
+//! `crate::admin::config_schema_handler` at `GET /__admin/config/schema`.
 //!
 //! # Drift detection
 //!
-//! [`tests::schema_covers_default_config`] (in this module's `#[cfg(test)]`
+//! `tests::schema_covers_default_config` (in this module's `#[cfg(test)]`
 //! block) round-trips `Config::default()` through serde JSON, walks every
 //! key, and asserts a matching `ConfigFieldSchema` exists in
 //! [`CONFIG_SCHEMA`]. Adding a field to `config.rs` without adding it here
@@ -191,6 +191,14 @@ pub static CONFIG_SCHEMA: &[ConfigSectionSchema] = &[
                 enum_values: None,
             },
             ConfigFieldSchema {
+                key: "admin_allowed_hosts",
+                field_type: "string[]",
+                default: Some("[]"),
+                description: "Extra Host/Origin names the admin listener accepts besides loopback; others get 403.",
+                optional: false,
+                enum_values: None,
+            },
+            ConfigFieldSchema {
                 key: "public_url",
                 field_type: "string",
                 default: None,
@@ -211,6 +219,22 @@ pub static CONFIG_SCHEMA: &[ConfigSectionSchema] = &[
                 field_type: "u32",
                 default: Some("500"),
                 description: "Maximum per-file upload size in megabytes.",
+                optional: false,
+                enum_values: None,
+            },
+            ConfigFieldSchema {
+                key: "upload_max_total_mb",
+                field_type: "u32",
+                default: Some("5120"),
+                description: "Total disk space all uploaded files may use, in megabytes.",
+                optional: false,
+                enum_values: None,
+            },
+            ConfigFieldSchema {
+                key: "upload_max_files",
+                field_type: "u32",
+                default: Some("100"),
+                description: "Maximum number of uploaded files kept at once.",
                 optional: false,
                 enum_values: None,
             },
@@ -275,6 +299,14 @@ pub static CONFIG_SCHEMA: &[ConfigSectionSchema] = &[
                 field_type: "u64",
                 default: Some("30"),
                 description: "Per-request render timeout. Requests exceeding this are dropped.",
+                optional: false,
+                enum_values: None,
+            },
+            ConfigFieldSchema {
+                key: "queue_size",
+                field_type: "usize",
+                default: Some("256"),
+                description: "Render requests that may wait for a free worker. More are rejected with 503.",
                 optional: false,
                 enum_values: None,
             },
@@ -357,6 +389,46 @@ pub static CONFIG_SCHEMA: &[ConfigSectionSchema] = &[
         ],
     },
     ConfigSectionSchema {
+        header: "[live]",
+        blurb: "Live source updates over WebSocket (GET /ws). Clients get a `reload` message when a source's data or config changes.",
+        feature_gate: None,
+        is_array: false,
+        fields: &[
+            ConfigFieldSchema {
+                key: "enabled",
+                field_type: "bool",
+                default: Some("false"),
+                description: "Mount GET /ws and broadcast source reloads.",
+                optional: false,
+                enum_values: None,
+            },
+            ConfigFieldSchema {
+                key: "watch",
+                field_type: "string[]",
+                default: Some("[]"),
+                description: "Source ids to poll for data changes (file mtime/size, or HTTP ETag/Last-Modified). [\"*\"] polls every source.",
+                optional: false,
+                enum_values: None,
+            },
+            ConfigFieldSchema {
+                key: "interval_secs",
+                field_type: "u64",
+                default: Some("5"),
+                description: "Seconds between polls of the watched sources (minimum 1).",
+                optional: false,
+                enum_values: None,
+            },
+            ConfigFieldSchema {
+                key: "max_clients",
+                field_type: "usize",
+                default: Some("1000"),
+                description: "Maximum concurrent WebSocket clients; further clients get 503.",
+                optional: false,
+                enum_values: None,
+            },
+        ],
+    },
+    ConfigSectionSchema {
         header: "[llm]",
         blurb: "Server-side LLM proxy for the Map AI chat panel (POST /api/llm/chat). \
             The API key is read from an environment variable and never reaches the browser.",
@@ -433,6 +505,14 @@ pub static CONFIG_SCHEMA: &[ConfigSectionSchema] = &[
                 field_type: "u32",
                 default: Some("30"),
                 description: "Proxy requests allowed per minute across all clients; 0 = unlimited.",
+                optional: false,
+                enum_values: None,
+            },
+            ConfigFieldSchema {
+                key: "max_output_tokens",
+                field_type: "u32",
+                default: Some("8192"),
+                description: "Cap on max_tokens, max_completion_tokens and thinking budget in proxied requests; n is forced to 1.",
                 optional: false,
                 enum_values: None,
             },
@@ -539,6 +619,30 @@ pub static CONFIG_SCHEMA: &[ConfigSectionSchema] = &[
                 description: "Strict = bucketed zoom, no tile coords. Standard = alias of strict. Verbose = full zoom 0..22.",
                 optional: false,
                 enum_values: Some(METRICS_CARDINALITY),
+            },
+            ConfigFieldSchema {
+                key: "dashboard",
+                field_type: "bool",
+                default: Some("false"),
+                description: "Collect per-request statistics for the admin analytics dashboard (GET /__admin/stats, /admin/analytics). In-memory and bounded.",
+                optional: false,
+                enum_values: None,
+            },
+            ConfigFieldSchema {
+                key: "dashboard_recent_requests",
+                field_type: "usize",
+                default: Some("200"),
+                description: "Requests kept in the dashboard's recent-requests list (max 10000).",
+                optional: false,
+                enum_values: None,
+            },
+            ConfigFieldSchema {
+                key: "dashboard_heatmap_zoom",
+                field_type: "u8",
+                default: Some("10"),
+                description: "Zoom level (0-16) the dashboard heatmap aggregates requests to.",
+                optional: false,
+                enum_values: None,
             },
         ],
     },
@@ -1210,6 +1314,14 @@ pub static CONFIG_SCHEMA: &[ConfigSectionSchema] = &[
                 field_type: "path",
                 default: None,
                 description: "Required when enabled = true. RSA PKCS#8 PEM private key.",
+                optional: true,
+                enum_values: None,
+            },
+            ConfigFieldSchema {
+                key: "approval_secret",
+                field_type: "string",
+                default: None,
+                description: "Required when enabled = true. Operator code the consent page asks for before it issues an authorization code.",
                 optional: true,
                 enum_values: None,
             },

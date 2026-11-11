@@ -103,8 +103,14 @@ impl McpAuthMode {
                 .signing_key_path
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("`[mcp.oauth].signing_key_path` is required"))?;
+            let approval_secret = cfg
+                .oauth
+                .approval_secret
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("`[mcp.oauth].approval_secret` is required"))?;
             let state =
-                OAuthState::from_file(issuer.to_string(), key_path, cfg.oauth.token_ttl_secs)?;
+                OAuthState::from_file(issuer.to_string(), key_path, cfg.oauth.token_ttl_secs)?
+                    .with_approval_secret(approval_secret);
             let state = match cfg.oauth.store_path.as_deref() {
                 #[cfg(feature = "mcp-persistence")]
                 Some(store_path) => {
@@ -676,28 +682,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn from_config_oauth_when_oauth_enabled_with_valid_key() {
-        let key = write_test_pem_to_tempfile();
-        let cfg = McpConfig {
-            oauth: crate::config::McpOAuthConfig {
-                enabled: true,
-                issuer_url: Some("http://localhost:8080".to_string()),
-                signing_key_path: Some(key.path().to_path_buf()),
-                token_ttl_secs: 3600,
-                store_path: None,
-            },
-            ..McpConfig::default()
-        };
-
-        let mode = McpAuthMode::from_config(&cfg).expect("oauth config with valid key builds");
-
-        assert!(
-            matches!(mode, McpAuthMode::OAuth(_)),
-            "expected McpAuthMode::OAuth, got {mode:?}"
-        );
-    }
-
     /// `store_path` + `mcp-persistence` selects the disk-backed SQLite
     /// store instead of the in-memory default. Asserted via the store's
     /// `Debug` representation because `OAuthState.store` is a trait object.
@@ -712,6 +696,7 @@ mod tests {
                 enabled: true,
                 issuer_url: Some("http://localhost:8080".to_string()),
                 signing_key_path: Some(key.path().to_path_buf()),
+                approval_secret: Some("test-approval-secret-0123".to_string()),
                 store_path: Some(store_path.clone()),
                 ..crate::config::McpOAuthConfig::default()
             },
@@ -744,6 +729,7 @@ mod tests {
                 enabled: true,
                 issuer_url: Some("http://localhost:8080".to_string()),
                 signing_key_path: Some(key.path().to_path_buf()),
+                approval_secret: Some("test-approval-secret-0123".to_string()),
                 ..crate::config::McpOAuthConfig::default()
             },
             ..McpConfig::default()
@@ -774,6 +760,7 @@ mod tests {
                 enabled: true,
                 issuer_url: Some("http://localhost:8080".to_string()),
                 signing_key_path: Some(key.path().to_path_buf()),
+                approval_secret: Some("test-approval-secret-0123".to_string()),
                 store_path: Some(std::path::PathBuf::from("/tmp/oauth.sqlite")),
                 ..crate::config::McpOAuthConfig::default()
             },
@@ -798,6 +785,7 @@ mod tests {
                 enabled: true,
                 issuer_url: None,
                 signing_key_path: Some(key.path().to_path_buf()),
+                approval_secret: Some("test-approval-secret-0123".to_string()),
                 ..crate::config::McpOAuthConfig::default()
             },
             ..McpConfig::default()

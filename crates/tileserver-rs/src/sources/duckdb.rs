@@ -30,20 +30,41 @@ pub fn tile_to_bbox(z: u8, x: u32, y: u32) -> [f64; 4] {
     [lon_min, lat_min, lon_max, lat_max]
 }
 
+/// Fill the `{z}`, `{x}`, `{y}`, `{bbox}` and `{bbox_xmin}`…`{bbox_ymax}`
+/// placeholders in `query` in one pass. Other `{…}` text is copied as is.
 #[must_use]
 pub fn substitute_template(query: &str, z: u8, x: u32, y: u32, bbox: &[f64; 4]) -> String {
-    query
-        .replace("{z}", &z.to_string())
-        .replace("{x}", &x.to_string())
-        .replace("{y}", &y.to_string())
-        .replace(
-            "{bbox}",
-            &format!("{}, {}, {}, {}", bbox[0], bbox[1], bbox[2], bbox[3]),
-        )
-        .replace("{bbox_xmin}", &bbox[0].to_string())
-        .replace("{bbox_ymin}", &bbox[1].to_string())
-        .replace("{bbox_xmax}", &bbox[2].to_string())
-        .replace("{bbox_ymax}", &bbox[3].to_string())
+    use std::fmt::Write as _;
+
+    let mut out = String::with_capacity(query.len() + 64);
+    let mut rest = query;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let tail = &rest[open..];
+        let Some(close) = tail.find('}') else {
+            rest = tail;
+            break;
+        };
+        // Writing to a String never fails.
+        let _ = match &tail[1..close] {
+            "z" => write!(out, "{z}"),
+            "x" => write!(out, "{x}"),
+            "y" => write!(out, "{y}"),
+            "bbox" => write!(out, "{}, {}, {}, {}", bbox[0], bbox[1], bbox[2], bbox[3]),
+            "bbox_xmin" => write!(out, "{}", bbox[0]),
+            "bbox_ymin" => write!(out, "{}", bbox[1]),
+            "bbox_xmax" => write!(out, "{}", bbox[2]),
+            "bbox_ymax" => write!(out, "{}", bbox[3]),
+            _ => {
+                out.push('{');
+                rest = &tail[1..];
+                continue;
+            }
+        };
+        rest = &tail[close + 1..];
+    }
+    out.push_str(rest);
+    out
 }
 
 #[inline]
@@ -502,6 +523,10 @@ pub struct DuckDbSource {
 }
 
 impl DuckDbSource {
+    /// # Errors
+    ///
+    /// [`TileServerError::DuckDbError`] when `query` is missing or the
+    /// database cannot be opened.
     pub async fn from_config(config: &SourceConfig) -> Result<Self> {
         let query = config.query.clone().ok_or_else(|| {
             TileServerError::DuckDbError(
@@ -573,6 +598,92 @@ impl DuckDbSource {
     }
 }
 
+/// Run the tile query and turn each row with a geometry into a feature.
+fn query_features(conn: &Connection, sql: &str, tile_bbox: &[f64; 4]) -> Result<Vec<MvtFeature>> {
+    let mut stmt = conn
+        .prepare(sql)
+        .map_err(|e| TileServerError::DuckDbError(format!("query preparation failed: {e}")))?;
+    let mut rows = stmt
+        .query([])
+        .map_err(|e| TileServerError::DuckDbError(format!("query execution failed: {e}")))?;
+    let column_names: Vec<String> = rows
+        .as_ref()
+        .map(|s| {
+            (0..s.column_count())
+                .map(|i| {
+                    s.column_name(i)
+                        .map_or_else(|_| format!("col_{i}"), ToString::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut features = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| TileServerError::DuckDbError(format!("row read failed: {e}")))?
+    {
+        if let Some(feature) = row_feature(row, &column_names, tile_bbox) {
+            features.push(feature);
+        }
+    }
+    Ok(features)
+}
+
+/// The feature for one row: the geometry column as WKB, every other column
+/// a property. `None` without a usable geometry.
+fn row_feature(
+    row: &duckdb::Row<'_>,
+    column_names: &[String],
+    tile_bbox: &[f64; 4],
+) -> Option<MvtFeature> {
+    let mut wkb: Option<Vec<u8>> = None;
+    let mut properties = Vec::new();
+    for (i, name) in column_names.iter().enumerate() {
+        if is_geometry_column(name) {
+            wkb = row.get::<_, Vec<u8>>(i).ok();
+        } else if let Some(value) = row_value(row, i) {
+            properties.push((name.clone(), value));
+        }
+    }
+    let wkb = wkb.filter(|w| !w.is_empty())?;
+    let (geometry, geom_type) = wkb_to_mvt(&wkb, tile_bbox)?;
+    Some(MvtFeature {
+        geom_type,
+        geometry,
+        properties,
+    })
+}
+
+fn is_geometry_column(name: &str) -> bool {
+    matches!(
+        name.to_lowercase().as_str(),
+        "geom" | "geometry" | "wkb_geometry"
+    )
+}
+
+/// The column's value as an MVT property, by its DuckDB type. NULLs, blobs,
+/// temporal and nested values are skipped.
+fn row_value(row: &duckdb::Row<'_>, i: usize) -> Option<PropValue> {
+    use duckdb::types::ValueRef;
+    Some(match row.get_ref(i).ok()? {
+        ValueRef::Text(t) => PropValue::String(String::from_utf8_lossy(t).into_owned()),
+        ValueRef::Boolean(b) => PropValue::Bool(b),
+        ValueRef::TinyInt(n) => PropValue::Int(n.into()),
+        ValueRef::SmallInt(n) => PropValue::Int(n.into()),
+        ValueRef::Int(n) => PropValue::Int(n.into()),
+        ValueRef::BigInt(n) => PropValue::Int(n),
+        ValueRef::UTinyInt(n) => PropValue::Int(n.into()),
+        ValueRef::USmallInt(n) => PropValue::Int(n.into()),
+        ValueRef::UInt(n) => PropValue::Int(n.into()),
+        ValueRef::UBigInt(n) => PropValue::Int(i64::try_from(n).ok()?),
+        ValueRef::HugeInt(n) => PropValue::Int(i64::try_from(n).ok()?),
+        ValueRef::Float(f) => PropValue::Double(f.into()),
+        ValueRef::Double(f) => PropValue::Double(f),
+        ValueRef::Decimal(d) => PropValue::Double(d.to_string().parse().ok()?),
+        _ => return None,
+    })
+}
+
 #[async_trait]
 impl TileSource for DuckDbSource {
     async fn get_tile(&self, z: u8, x: u32, y: u32) -> Result<Option<TileData>> {
@@ -589,77 +700,8 @@ impl TileSource for DuckDbSource {
             let conn = conn.lock().map_err(|e| {
                 TileServerError::DuckDbError(format!("connection lock poisoned: {e}"))
             })?;
-
-            let mut stmt = conn.prepare(&sql).map_err(|e| {
-                TileServerError::DuckDbError(format!("query preparation failed: {e}"))
-            })?;
-
-            let mut features: Vec<MvtFeature> = Vec::new();
-
-            let mut rows = stmt.query([]).map_err(|e| {
-                TileServerError::DuckDbError(format!("query execution failed: {e}"))
-            })?;
-
-            let column_count = rows.as_ref().map(|s| s.column_count()).unwrap_or(0);
-            let column_names: Vec<String> = rows
-                .as_ref()
-                .map(|s| {
-                    (0..column_count)
-                        .map(|i| {
-                            s.column_name(i)
-                                .map(|n| n.to_string())
-                                .unwrap_or_else(|_| format!("col_{i}"))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            while let Some(row) = rows
-                .next()
-                .map_err(|e| TileServerError::DuckDbError(format!("row read failed: {e}")))?
-            {
-                let mut geometry_wkb: Option<Vec<u8>> = None;
-                let mut properties: Vec<(String, PropValue)> = Vec::new();
-
-                for (i, col_name) in column_names.iter().enumerate() {
-                    let lower = col_name.to_lowercase();
-                    if lower == "geom" || lower == "geometry" || lower == "wkb_geometry" {
-                        if let Ok(blob) = row.get::<_, Vec<u8>>(i) {
-                            geometry_wkb = Some(blob);
-                        }
-                        continue;
-                    }
-
-                    if let Ok(val) = row.get::<_, String>(i) {
-                        properties.push((col_name.clone(), PropValue::String(val)));
-                    } else if let Ok(val) = row.get::<_, i64>(i) {
-                        properties.push((col_name.clone(), PropValue::Int(val)));
-                    } else if let Ok(val) = row.get::<_, f64>(i) {
-                        properties.push((col_name.clone(), PropValue::Double(val)));
-                    } else if let Ok(val) = row.get::<_, bool>(i) {
-                        properties.push((col_name.clone(), PropValue::Bool(val)));
-                    }
-                }
-
-                let wkb = match geometry_wkb {
-                    Some(ref w) if !w.is_empty() => w,
-                    _ => continue,
-                };
-
-                if let Some((geom, geom_type)) = wkb_to_mvt(wkb, &tile_bbox) {
-                    features.push(MvtFeature {
-                        geom_type,
-                        geometry: geom,
-                        properties,
-                    });
-                }
-            }
-
-            if features.is_empty() {
-                return Ok(None);
-            }
-
-            Ok(Some(encode_mvt_tile(&features, &layer_name)))
+            let features = query_features(&conn, &sql, &tile_bbox)?;
+            Ok((!features.is_empty()).then(|| encode_mvt_tile(&features, &layer_name)))
         })
         .await
         .map_err(|e| TileServerError::DuckDbError(format!("task join error: {e}")))?;
@@ -686,6 +728,133 @@ impl TileSource for DuckDbSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn row_value_maps_each_duckdb_type() {
+        let conn = Connection::open_in_memory().unwrap();
+        let sql = "SELECT 'a'::VARCHAR, true, 1::TINYINT, 2::SMALLINT, 3::INTEGER, \
+                   4::BIGINT, 5::UTINYINT, 6::USMALLINT, 7::UINTEGER, 8::UBIGINT, \
+                   9::HUGEINT, 1.5::FLOAT, 2.5::DOUBLE, 3.25::DECIMAL(5,2), \
+                   18446744073709551615::UBIGINT, NULL::INTEGER, DATE '2024-01-01'";
+        let mut stmt = conn.prepare(sql).unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        let row = rows.next().unwrap().unwrap();
+        let values: Vec<String> = (0..17)
+            .map(|i| match row_value(row, i) {
+                Some(PropValue::String(v)) => format!("s:{v}"),
+                Some(PropValue::Bool(v)) => format!("b:{v}"),
+                Some(PropValue::Int(v)) => format!("i:{v}"),
+                Some(PropValue::Double(v)) => format!("d:{v}"),
+                None => "none".to_string(),
+            })
+            .collect();
+        assert_eq!(
+            values,
+            [
+                "s:a", "b:true", "i:1", "i:2", "i:3", "i:4", "i:5", "i:6", "i:7", "i:8", "i:9",
+                "d:1.5", "d:2.5", "d:3.25",
+                // u64::MAX does not fit an i64; NULL and DATE are skipped.
+                "none", "none", "none",
+            ]
+        );
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// A query that needs no tables: one Florence point with every property
+    /// type, plus rows with a NULL and an empty geometry.
+    fn florence_query() -> String {
+        let mut point = vec![1, 1, 0, 0, 0];
+        point.extend_from_slice(&11.2558f64.to_le_bytes());
+        point.extend_from_slice(&43.7696f64.to_le_bytes());
+        let wkb = hex(&point);
+        format!(
+            "SELECT 'Firenze' AS name, 382258::BIGINT AS population, 50.5::DOUBLE AS height, \
+             true AS capital, 1.25::DECIMAL(5,2) AS ratio, 7::TINYINT AS rank, \
+             DATE '2020-01-01' AS founded, from_hex('{wkb}') AS geom \
+             UNION ALL SELECT 'none', 0, 0, false, 0, 0, NULL, NULL::BLOB \
+             UNION ALL SELECT 'empty', 0, 0, false, 0, 0, NULL, ''::BLOB"
+        )
+    }
+
+    fn config(query: Option<&str>) -> SourceConfig {
+        let mut toml = "id = \"duck\"\ntype = \"duckdb\"\npath = \"\"\nmaxzoom = 10\n".to_string();
+        if let Some(q) = query {
+            toml.push_str(&format!("query = {}\n", toml::Value::String(q.to_string())));
+        }
+        toml::from_str(&toml).unwrap()
+    }
+
+    #[test]
+    fn query_features_keeps_rows_with_a_geometry_and_reads_properties() {
+        let conn = Connection::open_in_memory().unwrap();
+        let features = query_features(&conn, &florence_query(), &tile_to_bbox(0, 0, 0)).unwrap();
+        assert_eq!(features.len(), 1, "NULL and empty geometries are skipped");
+        let props = &features[0].properties;
+        let get = |k: &str| props.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+        assert!(matches!(get("name"), Some(PropValue::String(s)) if s == "Firenze"));
+        assert!(matches!(get("population"), Some(PropValue::Int(382_258))));
+        assert!(matches!(get("height"), Some(PropValue::Double(h)) if h == 50.5));
+        assert!(matches!(get("capital"), Some(PropValue::Bool(true))));
+        assert!(matches!(get("ratio"), Some(PropValue::Double(r)) if r == 1.25));
+        assert!(matches!(get("rank"), Some(PropValue::Int(7))));
+        assert!(get("founded").is_none(), "dates are not MVT values");
+        assert!(get("geom").is_none());
+    }
+
+    #[test]
+    fn query_features_reports_bad_sql() {
+        let conn = Connection::open_in_memory().unwrap();
+        let err = query_features(&conn, "SELEC nope", &tile_to_bbox(0, 0, 0))
+            .err()
+            .unwrap();
+        assert!(
+            err.to_string().contains("query preparation failed"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn geometry_column_names_are_case_insensitive() {
+        for name in ["geom", "GEOMETRY", "wkb_geometry"] {
+            assert!(is_geometry_column(name), "{name}");
+        }
+        assert!(!is_geometry_column("geom_id"));
+    }
+
+    #[tokio::test]
+    async fn source_serves_tiles_and_honours_zoom_limits() {
+        let source = DuckDbSource::from_config(&config(Some(&florence_query())))
+            .await
+            .unwrap();
+        assert_eq!(source.metadata().name, "duckdb");
+        let tile = source.get_tile(0, 0, 0).await.unwrap().unwrap();
+        assert_eq!(tile.format, TileFormat::Pbf);
+        assert!(!tile.data.is_empty());
+        assert!(
+            source.get_tile(11, 0, 0).await.unwrap().is_none(),
+            "above maxzoom"
+        );
+    }
+
+    #[tokio::test]
+    async fn source_with_no_matching_rows_has_no_tile() {
+        let source = DuckDbSource::from_config(&config(Some("SELECT 1 AS id WHERE false")))
+            .await
+            .unwrap();
+        assert!(source.get_tile(0, 0, 0).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn from_config_requires_a_query() {
+        let err = DuckDbSource::from_config(&config(None))
+            .await
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("requires a 'query'"), "{err}");
+    }
 
     #[test]
     fn test_tile_to_bbox_zoom_0() {
@@ -716,13 +885,10 @@ mod tests {
     }
 
     #[test]
-    fn test_substitute_template_bbox() {
-        let query = "WHERE ST_Intersects(geom, ST_MakeEnvelope({bbox}))";
-        let result = substitute_template(query, 0, 0, 0, &[-180.0, -85.0, 180.0, 85.0]);
-        assert!(result.contains("-180"));
-        assert!(result.contains("180"));
-        assert!(result.contains("-85"));
-        assert!(result.contains("85"));
+    fn test_substitute_template_keeps_other_braces() {
+        let query = "SELECT '{\"a\": {z}}' WHERE x = {x} AND {other} {";
+        let result = substitute_template(query, 3, 4, 5, &[0.0, 0.0, 1.0, 1.0]);
+        assert_eq!(result, "SELECT '{\"a\": 3}' WHERE x = 4 AND {other} {");
     }
 
     #[test]
@@ -794,35 +960,6 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_mvt_tile_basic() {
-        let features = vec![MvtFeature {
-            geom_type: 1,
-            geometry: vec![mvt_command(1, 1), zigzag_encode(100), zigzag_encode(200)],
-            properties: vec![("name".to_string(), PropValue::String("test".to_string()))],
-        }];
-        let bytes = encode_mvt_tile(&features, "test_layer");
-        assert!(!bytes.is_empty());
-    }
-
-    #[test]
-    fn test_encode_mvt_value_string() {
-        let bytes = encode_mvt_value(&PropValue::String("hello".to_string()));
-        assert!(!bytes.is_empty());
-    }
-
-    #[test]
-    fn test_encode_mvt_value_int() {
-        let bytes = encode_mvt_value(&PropValue::Int(42));
-        assert!(!bytes.is_empty());
-    }
-
-    #[test]
-    fn test_encode_mvt_value_bool() {
-        let bytes = encode_mvt_value(&PropValue::Bool(true));
-        assert!(!bytes.is_empty());
-    }
-
-    #[test]
     fn test_config_source_type_duckdb_serde() {
         use crate::config::SourceType;
         let json = serde_json::to_string(&SourceType::DuckDB).unwrap();
@@ -873,28 +1010,6 @@ mod tests {
         );
         assert!(config.sources[0].query.is_some());
         assert!(config.sources[0].layer_name.is_none());
-    }
-
-    #[test]
-    fn test_duckdb_connection_open_in_memory() {
-        let conn = Connection::open_in_memory();
-        assert!(conn.is_ok());
-    }
-
-    #[test]
-    fn test_duckdb_basic_query() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE t (id INTEGER, name VARCHAR); INSERT INTO t VALUES (1, 'test');",
-        )
-        .unwrap();
-        let mut stmt = conn.prepare("SELECT id, name FROM t").unwrap();
-        let mut rows = stmt.query([]).unwrap();
-        let row = rows.next().unwrap().unwrap();
-        let id: i32 = row.get(0).unwrap();
-        let name: String = row.get(1).unwrap();
-        assert_eq!(id, 1);
-        assert_eq!(name, "test");
     }
 }
 

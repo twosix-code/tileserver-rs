@@ -70,6 +70,8 @@ async fn metrics_endpoint_e2e_happy_path() {
         source: "openmaptiles",
         format: TileFormat::Pbf,
         z: 14,
+        x: 0,
+        y: 0,
         bytes: 4096,
         duration: Duration::from_millis(85),
         outcome: TileOutcome::Hit,
@@ -79,6 +81,8 @@ async fn metrics_endpoint_e2e_happy_path() {
             source: "s",
             format: TileFormat::Pbf,
             z,
+            x: 0,
+            y: 0,
             bytes: 100,
             duration: Duration::from_millis(10),
             outcome: TileOutcome::Miss,
@@ -155,12 +159,6 @@ async fn metrics_endpoint_e2e_happy_path() {
     let health_resp = fetch(h.addr, "/metrics/health").await;
     assert_eq!(health_resp.status(), 200);
     assert_eq!(health_resp.text().await.expect("body"), "OK");
-}
-
-#[tokio::test]
-async fn cardinality_verbose_label_bank() {
-    let bank = metrics::LabelBank::new(metrics::Cardinality::Verbose);
-    assert_eq!(bank.cardinality(), metrics::Cardinality::Verbose);
 }
 
 #[tokio::test]

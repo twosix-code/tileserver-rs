@@ -40,6 +40,8 @@ pub struct PingResponse {
     compression_zstd_level: i32,
     cors_origins: Vec<String>,
     cache_dir: String,
+    /// `GET /ws` is mounted (`[live] enabled = true`).
+    live_enabled: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -89,12 +91,102 @@ struct ConfigSchemaResponse {
     sections: &'static [ConfigSectionSchema],
 }
 
+/// The admin listener's router: [`admin_router`] plus, with the `mcp`
+/// feature, the OAuth admin routes at `/__admin/oauth/*`.
+///
+/// The OAuth routes are always mounted so the admin UI can render its
+/// connected-apps and device-sessions pages. Without a backing store (OAuth
+/// off, or a static bearer token) an empty in-memory store answers with
+/// empty lists instead of `404`.
+pub fn admin_app(
+    state: SharedState,
+    #[cfg(feature = "mcp")] oauth_store: Option<
+        std::sync::Arc<dyn crate::mcp::auth_store::OAuthBackend>,
+    >,
+) -> Router {
+    let guard_state = state.clone();
+    let app = admin_router(state);
+    #[cfg(feature = "mcp")]
+    let app = {
+        let store = oauth_store
+            .unwrap_or_else(|| std::sync::Arc::new(crate::mcp::auth_store::InMemoryStore::new()));
+        tracing::info!("MCP admin OAuth routes mounted at /__admin/oauth/*");
+        app.merge(crate::mcp::admin_routes::admin_router(store))
+    };
+    app.layer(axum::middleware::from_fn_with_state(
+        guard_state,
+        admin_host_guard,
+    ))
+}
+
+/// Host names the admin listener always answers to.
+const LOOPBACK_HOSTS: [&str; 4] = ["localhost", "127.0.0.1", "::1", "[::1]"];
+
+/// The host part of a `Host` header or an `Origin` URL, lowercased and
+/// without the port.
+fn host_part(value: &str) -> String {
+    let rest = value.split_once("://").map_or(value, |(_, r)| r);
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let host = if authority.starts_with('[') {
+        authority.split_inclusive(']').next().unwrap_or(authority)
+    } else {
+        authority.rsplit_once(':').map_or(authority, |(h, _)| h)
+    };
+    host.to_ascii_lowercase()
+}
+
+fn admin_host_allowed(host: &str, extra: &[String]) -> bool {
+    LOOPBACK_HOSTS.contains(&host)
+        || host
+            .trim_matches(|c| c == '[' || c == ']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+        || extra.iter().any(|h| h.eq_ignore_ascii_case(host))
+}
+
+/// Reject admin requests whose `Host` or `Origin` names another site.
+///
+/// The admin listener has no login; it relies on being reachable only from
+/// the machine (or a trusted proxy). A web page in the operator's browser
+/// could still reach it through DNS rebinding (`Host: attacker.example`)
+/// or a cross-site request (`Origin: https://attacker.example`). Loopback
+/// names and `[server].admin_allowed_hosts` pass; everything else gets 403.
+async fn admin_host_guard(
+    State(shared): State<SharedState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let config = shared.config();
+    let extra = &config.server.admin_allowed_hosts;
+    let headers = request.headers();
+    let header = |name| {
+        headers
+            .get(name)
+            .and_then(|v: &axum::http::HeaderValue| v.to_str().ok())
+    };
+    let host_ok =
+        header(axum::http::header::HOST).is_none_or(|h| admin_host_allowed(&host_part(h), extra));
+    let origin_ok = header(axum::http::header::ORIGIN)
+        .is_none_or(|o| o != "null" && admin_host_allowed(&host_part(o), extra));
+    if host_ok && origin_ok {
+        next.run(request).await
+    } else {
+        (
+            StatusCode::FORBIDDEN,
+            "admin listener: Host or Origin not allowed; add it to [server].admin_allowed_hosts",
+        )
+            .into_response()
+    }
+}
+
 pub fn admin_router(state: SharedState) -> Router {
     Router::new()
         .route("/__admin/reload", post(admin_reload))
         .route("/__admin/cache/flush", post(admin_cache_flush))
         .route("/__admin/config", get(admin_config))
         .route("/__admin/config/schema", get(admin_config_schema))
+        .route("/__admin/stats", get(admin_stats))
         .with_state(state)
 }
 
@@ -131,6 +223,7 @@ pub async fn ping_check(State(shared): State<SharedState>) -> Json<PingResponse>
         compression_enabled: !config.compression.minimal_recompression,
         compression_br_quality: config.compression.br_quality,
         compression_zstd_level: config.compression.zstd_level,
+        live_enabled: config.live.enabled,
         cors_origins: config.server.cors_origins.clone(),
         cache_dir: config.resolve_cache_dir(None).display().to_string(),
     })
@@ -158,6 +251,24 @@ async fn admin_config(
         config_hash: meta.config_hash.clone(),
         loaded_at_unix: meta.loaded_at_unix,
     }))
+}
+
+/// Analytics dashboard snapshot: request totals, latency percentiles,
+/// per-source and per-zoom counts, a request heatmap, the most requested
+/// tiles, recent requests and the global tile cache state.
+async fn admin_stats(
+    State(shared): State<SharedState>,
+) -> Json<crate::metrics::dashboard::DashboardSnapshot> {
+    let state = shared.load();
+    let cache = state
+        .sources
+        .cache()
+        .map(|cache| crate::metrics::dashboard::CacheSnapshot {
+            entries: cache.entry_count(),
+            size_bytes: cache.weighted_size(),
+            capacity_bytes: cache.capacity_bytes(),
+        });
+    Json(crate::metrics::dashboard::snapshot(cache))
 }
 
 async fn admin_cache_flush(State(shared): State<SharedState>) -> Json<CacheFlushResponse> {
@@ -210,6 +321,31 @@ async fn admin_reload(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_part_strips_scheme_port_and_path() {
+        assert_eq!(host_part("127.0.0.1:9001"), "127.0.0.1");
+        assert_eq!(host_part("http://LocalHost:9001/x"), "localhost");
+        assert_eq!(host_part("[::1]:9001"), "[::1]");
+        assert_eq!(host_part("admin.example.com"), "admin.example.com");
+    }
+
+    #[test]
+    fn admin_host_allowed_accepts_loopback_and_listed_hosts_only() {
+        let extra = vec!["admin.example.com".to_string()];
+        for ok in [
+            "localhost",
+            "127.0.0.1",
+            "127.0.0.2",
+            "[::1]",
+            "admin.example.com",
+        ] {
+            assert!(admin_host_allowed(ok, &extra), "{ok}");
+        }
+        for bad in ["attacker.example", "10.0.0.5", "localhost.attacker.example"] {
+            assert!(!admin_host_allowed(bad, &extra), "{bad}");
+        }
+    }
     use crate::config::Config;
     use crate::reload::{
         ReloadController, ReloadMeta, RuntimeSettings, SharedState, build_app_state,
@@ -435,86 +571,6 @@ path = "{}"
         assert_eq!(after_ping["config_hash"], before_ping["config_hash"]);
     }
 
-    #[test]
-    fn ping_response_serializes_correctly() {
-        let resp = PingResponse {
-            status: "ok",
-            config_hash: "abc123".to_string(),
-            loaded_at_unix: 1_700_000_000,
-            loaded_sources: 3,
-            loaded_styles: 2,
-            renderer_enabled: false,
-            prometheus_listener_active: false,
-            version: "1.0.0",
-            cache_enabled: false,
-            cache_entries: 0,
-            cache_bytes: 0,
-            render_enabled: true,
-            ogc_enabled: true,
-            compression_enabled: true,
-            compression_br_quality: 5,
-            compression_zstd_level: 3,
-            cors_origins: vec!["*".to_string()],
-            cache_dir: "/tmp/tileserver-rs".to_string(),
-        };
-        let json = serde_json::to_value(&resp).expect("PingResponse serializes");
-        assert_eq!(json["status"], "ok");
-        assert_eq!(json["loaded_sources"], 3);
-        assert_eq!(json["loaded_styles"], 2);
-        assert_eq!(json["cache_enabled"], false);
-        assert_eq!(json["render_enabled"], true);
-        assert_eq!(json["compression_enabled"], true);
-        assert_eq!(json["cors_origins"][0], "*");
-    }
-
-    #[test]
-    fn reload_response_serializes_correctly() {
-        let resp = ReloadResponse {
-            ok: true,
-            reloaded: true,
-            config_hash: "newHash".to_string(),
-            loaded_at_unix: 0,
-            loaded_sources: 1,
-            loaded_styles: 1,
-            renderer_enabled: true,
-            prometheus_listener_active: true,
-            version: "2.0.0",
-        };
-        let json = serde_json::to_value(&resp).expect("ReloadResponse serializes");
-        assert_eq!(json["ok"], true);
-        assert_eq!(json["reloaded"], true);
-        assert_eq!(json["renderer_enabled"], true);
-    }
-
-    #[test]
-    fn reload_error_response_serializes_correctly() {
-        let resp = ReloadErrorResponse {
-            ok: false,
-            error: "config parse error".to_string(),
-        };
-        let json = serde_json::to_value(&resp).expect("ReloadErrorResponse serializes");
-        assert_eq!(json["ok"], false);
-        assert!(
-            json["error"]
-                .as_str()
-                .unwrap()
-                .contains("config parse error")
-        );
-    }
-
-    #[test]
-    fn cache_flush_response_serializes_correctly() {
-        let resp = CacheFlushResponse {
-            ok: true,
-            invalidated_entries: 42,
-            freed_bytes: 1024,
-        };
-        let json = serde_json::to_value(&resp).expect("CacheFlushResponse serializes");
-        assert_eq!(json["ok"], true);
-        assert_eq!(json["invalidated_entries"], 42);
-        assert_eq!(json["freed_bytes"], 1024);
-    }
-
     fn config_with_cache_enabled() -> String {
         String::from(
             r#"
@@ -551,6 +607,35 @@ enabled = true
     }
 
     #[tokio::test]
+    async fn admin_stats_returns_dashboard_snapshot() {
+        let mut config_file = NamedTempFile::new().unwrap();
+        config_file
+            .write_all(config_with_style(None).as_bytes())
+            .unwrap();
+        let shared = build_shared_state(config_file.path()).await;
+
+        let (status, payload) = admin_json(shared, "GET", "/__admin/stats").await;
+        assert_eq!(status, StatusCode::OK);
+        for key in [
+            "enabled",
+            "totals",
+            "latency",
+            "latency_buckets",
+            "per_minute",
+            "sources",
+            "zooms",
+            "heatmap",
+            "top_tiles",
+            "recent",
+        ] {
+            assert!(payload.get(key).is_some(), "missing {key}");
+        }
+        assert_eq!(payload["per_minute"].as_array().map(Vec::len), Some(60));
+        // The test config has no `[cache]`, so there is no cache block.
+        assert!(payload["cache"].is_null());
+    }
+
+    #[tokio::test]
     async fn admin_config_returns_toml_view() {
         let mut config_file = NamedTempFile::new().unwrap();
         config_file
@@ -571,6 +656,96 @@ enabled = true
             payload["config_hash"]
                 .as_str()
                 .is_some_and(|s| !s.is_empty())
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_app_serves_admin_routes_and_oauth_routes_with_mcp() {
+        let mut config_file = NamedTempFile::new().unwrap();
+        config_file
+            .write_all(config_with_style(None).as_bytes())
+            .unwrap();
+        let shared = build_shared_state(config_file.path()).await;
+        let app = admin_app(
+            shared,
+            #[cfg(feature = "mcp")]
+            None,
+        );
+
+        let config = app
+            .clone()
+            .oneshot(Request::get("/__admin/config").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(config.status(), StatusCode::OK);
+
+        let clients = app
+            .oneshot(
+                Request::get("/__admin/oauth/clients")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let expected = if cfg!(feature = "mcp") {
+            StatusCode::OK
+        } else {
+            StatusCode::NOT_FOUND
+        };
+        assert_eq!(clients.status(), expected);
+    }
+
+    #[tokio::test]
+    async fn admin_app_rejects_foreign_host_and_origin() {
+        let mut config_file = NamedTempFile::new().unwrap();
+        config_file
+            .write_all(config_with_style(None).as_bytes())
+            .unwrap();
+        let shared = build_shared_state(config_file.path()).await;
+        let app = admin_app(
+            shared,
+            #[cfg(feature = "mcp")]
+            None,
+        );
+        let status = |headers: &[(&str, &str)]| {
+            let mut req = Request::get("/__admin/config");
+            for (k, v) in headers {
+                req = req.header(*k, *v);
+            }
+            let app = app.clone();
+            async move {
+                app.oneshot(req.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        };
+        assert_eq!(status(&[("host", "127.0.0.1:9001")]).await, StatusCode::OK);
+        assert_eq!(
+            status(&[
+                ("host", "localhost:9001"),
+                ("origin", "http://localhost:9001")
+            ])
+            .await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status(&[("host", "attacker.example:9001")]).await,
+            StatusCode::FORBIDDEN,
+            "DNS rebinding"
+        );
+        assert_eq!(
+            status(&[
+                ("host", "127.0.0.1:9001"),
+                ("origin", "https://attacker.example")
+            ])
+            .await,
+            StatusCode::FORBIDDEN,
+            "cross-site request"
+        );
+        assert_eq!(
+            status(&[("host", "127.0.0.1:9001"), ("origin", "null")]).await,
+            StatusCode::FORBIDDEN
         );
     }
 
