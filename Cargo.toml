@@ -220,13 +220,20 @@ strip = false
 [profile.dev.package."*"]
 opt-level = 3
 
-# Point gdal + gdal-sys at georust/gdal master. GDAL 3.13 renamed `GDT_Byte`
-# to `GDT_UInt8` and added `bOperateInBufType` to `GDALRasterIOExtraArg`; the
-# gdal 0.19.0 crate predates that and fails to build against libgdal 3.13.
-# The fix (georust/gdal#714) is merged on master, with pre-built 3.13 bindings
-# (#723), but not released: master still carries gdal 0.19.0 / gdal-sys 0.12.0,
-# so this patch applies to the crates.io versions. Master requires GDAL >= 3.8
-# (#716). Drop this block once a gdal release > 0.19.0 lands (georust/gdal#715).
+# Point gdal + gdal-sys at AlexanderWillner/gdal#fix/gdal-3.13-compat
+# (georust/gdal PR #714). GDAL 3.13 renamed `GDT_Byte` to `GDT_UInt8` and added
+# `bOperateInBufType` to `GDALRasterIOExtraArg`; the gdal 0.19.0 crate predates
+# that and fails to build against libgdal 3.13.
+#
+# Pinned deliberately to the fork (not georust master): upstream main moved to
+# georust/gdal master, whose build script requires GDAL >= 3.8 (#716). Our build
+# host and the deploy runtime (`deploy/tileserver/tileserver-runtime`) are both
+# Debian 12 / GDAL 3.6.x with libgdal.so.32, and GDAL's soname bumps per minor
+# release, so a 3.8+ build would not load there. This pin requires only >= 3.4
+# and binds against the local headers (`features = ["bindgen"]`), so the
+# pre-built 3.13 bindings that motivated the master pin are unused anyway.
+# Drop this block once a gdal release > 0.19.0 lands with PR #714 included
+# (georust/gdal#715), and revisit if the runtime image moves off Debian 12.
 [patch.crates-io]
-gdal     = { git = "https://github.com/georust/gdal.git", rev = "c0a6266b987a2c2d44aea9956c2cae1ed71445cf" }
-gdal-sys = { git = "https://github.com/georust/gdal.git", rev = "c0a6266b987a2c2d44aea9956c2cae1ed71445cf" }
+gdal     = { git = "https://github.com/AlexanderWillner/gdal.git", rev = "968cf34a3101ef0aa6e418e779752fa282bc3269" }
+gdal-sys = { git = "https://github.com/AlexanderWillner/gdal.git", rev = "968cf34a3101ef0aa6e418e779752fa282bc3269" }
