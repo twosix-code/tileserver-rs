@@ -17,7 +17,6 @@ use crate::sources::{TileCompression, TileData, TileFormat, TileMetadata, TileSo
 const WEB_MERCATOR_EXTENT: f64 = 20037508.342789244;
 
 pub struct CogSource {
-
     metadata: TileMetadata,
     default_resampling: ResamplingMethod,
     band_count: usize,
@@ -121,7 +120,6 @@ impl CogSource {
         };
 
         Ok(Self {
-
             metadata,
             default_resampling: resampling,
             band_count,
@@ -135,7 +133,6 @@ impl CogSource {
     pub fn resampling(&self) -> ResamplingMethod {
         self.default_resampling
     }
-
 
     /// The source path, which is also the `dataset_cache` key of the base
     /// pool. A wrapping source (e.g. a DEM source whose `input_source` points
@@ -167,7 +164,6 @@ impl CogSource {
         let colormap = self.colormap.clone();
         let path = self.path.clone();
 
-
         // `overview_index` of 0 means "read the full-resolution base". Any
         // other value means "read from overview level `overview_index - 1`",
         // which requires re-opening the source with GDAL's `OVERVIEW_LEVEL`
@@ -186,7 +182,6 @@ impl CogSource {
         // The overview-pool cache lookup is async and runs on the async
         // runtime, before the blocking render is spawned.
         let render_pool: Arc<dataset_cache::Pool> = if overview_index == 0 {
-
             dataset_cache::global().get_or_open(&path).await?
         } else {
             let ovr_level = overview_index - 1;
@@ -946,6 +941,7 @@ mod tests {
             max_total_items: 64,
             mosaic_max_assets: 8,
             stac_bbox: None,
+            datetime: None,
             pixel_selection: crate::config::PixelSelectionMethod::First,
             tile_path_template: None,
             tms: false,
@@ -1018,5 +1014,4 @@ mod tests {
             "warp failure is surfaced, got {err:?}"
         );
     }
-
 }

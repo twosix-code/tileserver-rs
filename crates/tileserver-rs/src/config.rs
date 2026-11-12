@@ -1018,6 +1018,33 @@ pub struct SourceConfig {
     /// anchor discovery on whichever items the API happens to rank first.
     #[serde(default)]
     pub stac_bbox: Option<[f64; 4]>,
+    /// Pin this STAC source to one instant in time.
+    ///
+    /// Wired verbatim to STAC's standard `datetime` search parameter — an
+    /// RFC 3339 **instant only** (`"2024-01-01T00:00:00Z"`, or an offset form
+    /// such as `"2024-06-15T14:00:00+02:00"`). Intervals
+    /// (`"2023-01-01/2024-12-31"`, `"../.."`) are rejected: a span returns one
+    /// item per (footprint, timestep), which breaks the single-item-per-
+    /// footprint contract every STAC source is validated against at startup.
+    ///
+    /// Optional. Omit it for collections without a time dimension. A query
+    /// that returns multiple items per footprint fails startup with a hint
+    /// to set `datetime` — that is what a time-series collection looks like.
+    ///
+    /// Validation is deliberately cheap and does not depend on the shape of
+    /// the value: the shape is checked locally (no intervals, RFC 3339-ish
+    /// instant), and the STAC API is the oracle for everything else — the
+    /// startup search runs this exact instant and reports whether it matches
+    /// anything and whether the result set is one item per footprint. An
+    /// instant that matches nothing logs a startup warning (it may lie outside
+    /// the collection's temporal extent) but does not fail: an ocean bbox is
+    /// legitimately empty.
+    ///
+    /// Where a footprint has no item covering this instant, the area renders
+    /// as a void — accepted, not a bug.
+    #[serde(default)]
+    pub datetime: Option<String>,
+
     /// STAC mosaic pixel-selection method. Defaults to [`PixelSelectionMethod::First`]
     /// which preserves pre-4.0 behaviour (first asset wins where opaque).
     #[serde(default)]
@@ -2592,6 +2619,38 @@ server:
         assert_eq!(config.sources[0].source_type, SourceType::PMTiles);
         assert_eq!(config.sources[0].path, "/data/test.pmtiles");
         assert!(config.sources[0].name.is_none());
+    }
+
+    #[test]
+    fn test_source_config_stac_datetime_round_trip() {
+        // The instant is stored verbatim at this layer: shape validation and
+        // canonicalisation live in `sources::stac`, because a config parse
+        // must not reject a file it can read.
+        let toml_str = r#"
+            [[sources]]
+            id = "lulc"
+            type = "stac"
+            path = "https://stac.example.org"
+            collection = "C"
+            datetime = "2024-01-01T00:00:00Z"
+        "#;
+        let config: Config = toml::from_str(toml_str).expect("parse stac source with datetime");
+        assert_eq!(
+            config.sources[0].datetime.as_deref(),
+            Some("2024-01-01T00:00:00Z")
+        );
+
+        // Absent -> None, so a collection without a time dimension needs no
+        // extra key.
+        let toml_str = r#"
+            [[sources]]
+            id = "lulc"
+            type = "stac"
+            path = "https://stac.example.org"
+            collection = "C"
+        "#;
+        let config: Config = toml::from_str(toml_str).expect("parse stac source without datetime");
+        assert!(config.sources[0].datetime.is_none());
     }
 
     #[test]

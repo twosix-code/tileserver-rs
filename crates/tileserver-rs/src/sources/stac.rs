@@ -67,6 +67,10 @@ struct DynamicConfig {
     collection: String,
     /// Asset role used to pick the COG asset out of returned items.
     asset_role: String,
+    /// Optional RFC 3339 instant pinning every search to one point in time.
+    /// Already validated by [`parse_datetime_instant`] at source construction;
+    /// `None` leaves the source unpinned.
+    datetime: Option<String>,
     /// Page size for each STAC `/search` request (the `limit` sent on the wire).
     /// The total number of items fetched per tile is bounded by
     /// `max_total_items`, which may span several pages.
@@ -101,8 +105,65 @@ impl StacSource {
         let asset_role = &config.asset_role;
         let max_items = config.max_items;
 
-        let assets =
-            discover_assets(api_url, collection, asset_role, max_items, config.stac_bbox).await?;
+        // Validate the configured instant locally (shape only). Everything
+        // semantic — does it match anything, is it inside the collection's
+        // temporal extent, is the result one item per footprint — is answered
+        // by the STAC API itself on the startup search below.
+        //
+        // Decision (2026-11-12): no date library. A `chrono` direct dependency
+        // and an `extent.temporal.interval` envelope check were both dropped in
+        // favour of letting the API be the oracle: it already rejects a bare
+        // year with HTTP 400, and an instant that matches nothing comes back as
+        // an empty result set, which the startup search sees directly. The cost
+        // is that a typo'd instant is not *rejected* here — so a pinned source
+        // that discovers zero items logs a `warn` (below), not an `info`. That
+        // warning is the compensating control; it must stay loud.
+        let datetime =
+            match config.datetime.as_deref() {
+                Some(raw) => Some(parse_datetime_instant(raw).map_err(|e| {
+                    TileServerError::StacError(format!("source '{}': {e}", config.id))
+                })?),
+                None => None,
+            };
+
+        let assets = discover_assets(
+            api_url,
+            collection,
+            asset_role,
+            max_items,
+            config.stac_bbox,
+            datetime.as_deref(),
+        )
+        .await?;
+
+        // Global STAC contract: a source's query must return exactly one item
+        // per footprint. More than one is what a time-series collection looks
+        // like — the fix is to pin it with `datetime`, so say that.
+        validate_single_item_per_footprint(&assets, collection, datetime.as_deref())
+            .map_err(|e| TileServerError::StacError(format!("source '{}': {e}", config.id)))?;
+
+        if assets.is_empty() {
+            // A pinned source that matches nothing is a configuration smell:
+            // a typo'd instant, or one outside the collection's temporal
+            // extent, serves voids everywhere and looks like "the server went
+            // down". Without an envelope check this warning is the only signal
+            // at startup, so it is `warn` — and it names the knob to check.
+            if let Some(dt) = datetime.as_deref() {
+                tracing::warn!(
+                    source = %config.id,
+                    collection,
+                    datetime = dt,
+                    "stac source discovered no items for this datetime; every tile will be a \
+                     void — check the instant is inside the collection's temporal extent"
+                );
+            } else {
+                tracing::info!(
+                    source = %config.id,
+                    collection,
+                    "stac source discovered no items; its tiles will be voids"
+                );
+            }
+        }
 
         let bounds = config.stac_bbox.or_else(|| compute_merged_bounds(&assets));
         let name = config
@@ -120,6 +181,7 @@ impl StacSource {
                 api_url: api_url.to_string(),
                 collection: collection.to_string(),
                 asset_role: asset_role.to_string(),
+                datetime: datetime.clone(),
                 max_items,
                 max_total_items: config.max_total_items,
                 mosaic_max_assets: config.mosaic_max_assets,
@@ -210,6 +272,7 @@ impl StacSource {
             cfg.max_items,
             cfg.max_total_items,
             bbox,
+            cfg.datetime.as_deref(),
         )
         .await
         {
@@ -221,6 +284,13 @@ impl StacSource {
         };
 
         if assets.is_empty() {
+            tracing::debug!(
+                z,
+                x,
+                y,
+                datetime = cfg.datetime.as_deref().unwrap_or("-"),
+                "no stac assets for tile (void — expected where no item covers this bbox/datetime)"
+            );
             return Ok(None);
         }
 
@@ -272,6 +342,7 @@ pub async fn discover_assets(
     asset_role: &str,
     max_items: usize,
     bbox: Option<[f64; 4]>,
+    datetime: Option<&str>,
 ) -> Result<Vec<StacAsset>> {
     let mut search_body = serde_json::json!({
         "collections": [collection],
@@ -279,6 +350,9 @@ pub async fn discover_assets(
     });
     if let Some(b) = bbox {
         search_body["bbox"] = serde_json::json!(b);
+    }
+    if let Some(dt) = datetime {
+        search_body["datetime"] = serde_json::json!(dt);
     }
     search_assets(api_url, &search_body, asset_role).await
 }
@@ -534,11 +608,7 @@ pub fn compute_merged_bounds(assets: &[StacAsset]) -> Option<[f64; 4]> {
 /// set), fall back to the first `max` assets in input order so a tile is never
 /// rendered empty purely because of this filter.
 #[must_use]
-fn rank_assets_for_tile(
-    assets: &[StacAsset],
-    tile_bbox: [f64; 4],
-    max: usize,
-) -> Vec<StacAsset> {
+fn rank_assets_for_tile(assets: &[StacAsset], tile_bbox: [f64; 4], max: usize) -> Vec<StacAsset> {
     let mut scored: Vec<(f64, usize, &StacAsset)> = assets
         .iter()
         .enumerate()
@@ -744,15 +814,159 @@ fn search_cache_key(
     max_items: usize,
     max_total_items: usize,
     bbox: [f64; 4],
+    datetime: Option<&str>,
 ) -> String {
     let snap = |v: f64| (v / STAC_BBOX_KEY_GRID).round() * STAC_BBOX_KEY_GRID;
     format!(
-        "{api_url}|{collection}|{asset_role}|{max_items}|{max_total_items}|{},{},{},{}",
+        "{api_url}|{collection}|{asset_role}|{max_items}|{max_total_items}|{},{},{},{}|{}",
         snap(bbox[0]),
         snap(bbox[1]),
         snap(bbox[2]),
         snap(bbox[3]),
+        datetime.unwrap_or("-"),
     )
+}
+
+/// Parse the configured `datetime` into the value that goes on the wire.
+///
+/// Deliberately naive: this checks the **shape** and passes the value through
+/// verbatim. Everything semantic — does the instant match anything, is it
+/// inside the collection's temporal extent — is answered by the STAC API on
+/// the startup search. There is no date arithmetic here, and deliberately so:
+/// a calendar library would only second-guess an upstream that is already the
+/// authority, and could reject values the API would have accepted.
+///
+/// Rejected locally, because no API round-trip can make these correct:
+///
+///   - any interval (`"a/b"`, `"../.."`, open-ended) — a span returns one item
+///     per (footprint, timestep), which breaks the single-item-per-footprint
+///     contract this source is validated against;
+///   - anything that is not an RFC 3339 instant (`"2024"`, `"latest"`, `""`).
+fn parse_datetime_instant(raw: &str) -> Result<String> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err(TileServerError::StacError(
+            "`datetime` is empty; omit the key or give an RFC 3339 instant like \
+             \"2024-01-01T00:00:00Z\""
+                .to_string(),
+        ));
+    }
+    if value.contains('/') {
+        return Err(TileServerError::StacError(format!(
+            "`datetime` = {value:?} is an interval; only a single RFC 3339 instant is valid \
+             (an interval returns one item per footprint per timestep)"
+        )));
+    }
+    if !looks_like_rfc3339_instant(value) {
+        return Err(TileServerError::StacError(format!(
+            "`datetime` = {value:?} is not an RFC 3339 instant; expected e.g. \
+             \"2024-01-01T00:00:00Z\" (intervals and bare years are not accepted)"
+        )));
+    }
+    Ok(value.to_string())
+}
+
+/// Shape check for `YYYY-MM-DDTHH:MM:SS[.fff](Z|±HH:MM)`.
+///
+/// No calendar validation (month 13 passes) — that is the upstream's job. This
+/// only separates a plausible instant from intervals, bare years and prose.
+fn looks_like_rfc3339_instant(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() < 20 {
+        return false;
+    }
+    let digits = |r: std::ops::Range<usize>| {
+        b.get(r)
+            .is_some_and(|slice| slice.iter().all(u8::is_ascii_digit))
+    };
+    let date_ok = digits(0..4)
+        && b[4] == b'-'
+        && digits(5..7)
+        && b[7] == b'-'
+        && digits(8..10)
+        // RFC 3339 permits a space separator; STAC APIs in the wild use `T`.
+        && matches!(b[10], b'T' | b't' | b' ');
+    let time_ok =
+        digits(11..13) && b[13] == b':' && digits(14..16) && b[16] == b':' && digits(17..19);
+    if !(date_ok && time_ok) {
+        return false;
+    }
+
+    let mut i = 19;
+    if b.get(i) == Some(&b'.') {
+        i += 1;
+        let start = i;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == start {
+            return false; // lone `.` with no fraction digits
+        }
+    }
+
+    match b.get(i) {
+        Some(b'Z' | b'z') => i + 1 == b.len(),
+        Some(b'+' | b'-') => {
+            let offset = &b[i + 1..];
+            offset.len() == 5
+                && offset[..2].iter().all(u8::is_ascii_digit)
+                && offset[2] == b':'
+                && offset[3..].iter().all(u8::is_ascii_digit)
+        }
+        _ => false,
+    }
+}
+
+/// Grouping key for a footprint: `NaN`-safe, `Eq`/`Hash`-friendly, and
+/// byte-identical between this startup check and `dedupe_by_footprint`.
+fn footprint_key(bbox: [f64; 4]) -> [u64; 4] {
+    bbox.map(f64::to_bits)
+}
+
+/// Validate the global STAC contract: **one item per footprint**.
+///
+/// Multiple items sharing a footprint is what a time-series collection looks
+/// like (one item per timestep per place). Rendering it unpinned means serving
+/// an arbitrary subset of timesteps — bounded by `mosaic_max_assets`, so one
+/// place can starve its neighbours (the classic gap: a whole tile edge missing
+/// because one footprint's history filled the asset cap). That is not a
+/// recoverable runtime condition; it is a configuration error, and the fix is
+/// to pin the source with `datetime`.
+///
+/// This check is global to the STAC source type: it runs for every source at
+/// construction, pinned or not.
+fn validate_single_item_per_footprint(
+    assets: &[StacAsset],
+    collection: &str,
+    datetime: Option<&str>,
+) -> Result<()> {
+    let mut counts: Vec<([u64; 4], usize)> = Vec::with_capacity(assets.len());
+    for asset in assets {
+        let key = footprint_key(asset.bbox);
+        match counts.iter_mut().find(|(seen, _)| *seen == key) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((key, 1)),
+        }
+    }
+
+    let Some((key, n)) = counts.iter().find(|(_, n)| *n > 1) else {
+        return Ok(());
+    };
+    let bbox = key.map(f64::from_bits);
+    let hint = match datetime {
+        Some(dt) => format!(
+            "the provider appears to publish overlapping items for one instant \
+             (collection '{collection}', datetime={dt})"
+        ),
+        None => format!(
+            "multiple items per footprint hint at a time-series collection \
+             (collection '{collection}'): set `datetime` to an instant to pin it"
+        ),
+    };
+    Err(TileServerError::StacError(format!(
+        "query returns {n} items for one footprint {bbox:?}; a STAC source must return \
+         exactly one item per footprint — {hint}"
+    )))
 }
 
 /// Discover COG assets for a bbox, coalescing identical searches.
@@ -772,6 +986,7 @@ pub async fn discover_assets_by_bbox(
     max_items: usize,
     max_total_items: usize,
     bbox: [f64; 4],
+    datetime: Option<&str>,
 ) -> Result<Vec<StacAsset>> {
     let key = search_cache_key(
         api_url,
@@ -780,6 +995,7 @@ pub async fn discover_assets_by_bbox(
         max_items,
         max_total_items,
         bbox,
+        datetime,
     );
     super::search_cache::global()
         .get_or_search(key, || {
@@ -790,6 +1006,7 @@ pub async fn discover_assets_by_bbox(
                 max_items,
                 max_total_items,
                 bbox,
+                datetime,
             )
         })
         .await
@@ -812,6 +1029,7 @@ async fn search_assets_by_bbox(
     max_items: usize,
     max_total_items: usize,
     bbox: [f64; 4],
+    datetime: Option<&str>,
 ) -> Result<Vec<StacAsset>> {
     let search_url = build_search_url(api_url);
     let client = reqwest::Client::builder()
@@ -833,6 +1051,9 @@ async fn search_assets_by_bbox(
             "bbox": bbox,
             "limit": page_size
         });
+        if let Some(dt) = datetime {
+            search_body["datetime"] = serde_json::json!(dt);
+        }
         if let Some(token) = &next_token {
             search_body["token"] = serde_json::Value::String(token.clone());
         }
@@ -996,6 +1217,7 @@ fn asset_cog_config(template: &SourceConfig, href: &str) -> SourceConfig {
         max_total_items: template.max_total_items,
         mosaic_max_assets: template.mosaic_max_assets,
         stac_bbox: template.stac_bbox,
+        datetime: None,
         pixel_selection: template.pixel_selection,
         tile_path_template: None,
         tms: false,
@@ -2048,21 +2270,30 @@ mod mock_api_tests {
     type Requests = Arc<Mutex<Vec<serde_json::Value>>>;
 
     fn item(id: &str, cloud: f64) -> serde_json::Value {
+        item_in(id, cloud, [-122.5, 37.7, -122.3, 37.9])
+    }
+
+    /// An item with an explicit footprint. Distinct bboxes per item keep a
+    /// multi-item fixture a valid STAC source: the startup contract is one
+    /// item per footprint, so two items over one bbox now (correctly) fail.
+    fn item_in(id: &str, cloud: f64, bbox: [f64; 4]) -> serde_json::Value {
         let cog = format!(
             "{}/../../data/raster/test-rgb.cog.tif",
             env!("CARGO_MANIFEST_DIR")
         );
         serde_json::json!({
             "type": "Feature", "stac_version": "1.0.0", "id": id,
-            "geometry": null, "bbox": [-122.5, 37.7, -122.3, 37.9],
+            "geometry": null, "bbox": bbox,
             "properties": { "datetime": "2024-01-01T00:00:00Z", "eo:cloud_cover": cloud },
             "links": [],
             "assets": { "visual": { "href": cog, "type": "image/tiff; application=geotiff; profile=cloud-optimized", "roles": ["visual"] } }
         })
     }
 
-    /// `/two/search` and `/one/search` answer with items, `/down/search`
-    /// with a 500, `/odd/search` with JSON that is not an ItemCollection.
+    /// `/two/search` answers with two items over two footprints, `/one/search`
+    /// with one item, `/dupe/search` with two items over ONE footprint (the
+    /// rejected shape), `/down/search` with a 500, `/odd/search` with JSON that
+    /// is not an ItemCollection.
     async fn mock_api() -> (String, Requests) {
         use axum::{Json, Router, http::StatusCode, routing::post};
         let requests: Requests = Arc::default();
@@ -2074,6 +2305,7 @@ mod mock_api_tests {
         };
         let two = requests.clone();
         let one = requests.clone();
+        let dup = requests.clone();
         let app = Router::new()
             .route(
                 "/two/search",
@@ -2083,7 +2315,26 @@ mod mock_api_tests {
                         log(r)(body).await;
                         Json(serde_json::json!({
                             "type": "FeatureCollection",
-                            "features": [item("a", 40.0), item("b", 5.0)]
+                            "features": [
+                                item_in("a", 40.0, [-122.5, 37.7, -122.3, 37.9]),
+                                item_in("b", 5.0, [-122.3, 37.7, -122.1, 37.9])
+                            ]
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/dupe/search",
+                post(move |body: Json<serde_json::Value>| {
+                    let r = dup.clone();
+                    async move {
+                        log(r)(body).await;
+                        Json(serde_json::json!({
+                            "type": "FeatureCollection",
+                            "features": [
+                                item_in("a", 40.0, [-122.5, 37.7, -122.3, 37.9]),
+                                item_in("b", 5.0, [-122.5, 37.7, -122.3, 37.9])
+                            ]
                         }))
                     }
                 }),
@@ -2169,9 +2420,16 @@ mod mock_api_tests {
     async fn discover_assets_posts_the_search_and_reads_items() {
         let (base, requests) = mock_api().await;
         let api = format!("{base}/two");
-        let assets = discover_assets(&api, "sentinel", "visual", 7, Some([1.0, 2.0, 3.0, 4.0]))
-            .await
-            .unwrap();
+        let assets = discover_assets(
+            &api,
+            "sentinel",
+            "visual",
+            7,
+            Some([1.0, 2.0, 3.0, 4.0]),
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(assets.len(), 2);
         assert_eq!(assets[0].bbox, [-122.5, 37.7, -122.3, 37.9]);
         assert_eq!(assets[1].cloud_cover, Some(5.0));
@@ -2184,11 +2442,11 @@ mod mock_api_tests {
     #[tokio::test]
     async fn discover_assets_reports_http_and_shape_errors() {
         let (base, _) = mock_api().await;
-        let down = discover_assets(&format!("{base}/down"), "c", "visual", 1, None)
+        let down = discover_assets(&format!("{base}/down"), "c", "visual", 1, None, None)
             .await
             .unwrap_err();
         assert!(down.to_string().contains("status 500"), "{down}");
-        let odd = discover_assets(&format!("{base}/odd"), "c", "visual", 1, None)
+        let odd = discover_assets(&format!("{base}/odd"), "c", "visual", 1, None, None)
             .await
             .unwrap_err();
         assert!(odd.to_string().contains("FeatureCollection"), "{odd}");
@@ -2201,7 +2459,10 @@ mod mock_api_tests {
             .await
             .unwrap();
         assert_eq!(source.metadata().name, "STAC: sentinel");
-        assert_eq!(source.metadata().bounds, Some([-122.5, 37.7, -122.3, 37.9]));
+        // Two items over two distinct footprints (see `mock_api`): bounds are
+        // the merged union. Identical bboxes would now (correctly) fail the
+        // one-item-per-footprint startup contract.
+        assert_eq!(source.metadata().bounds, Some([-122.5, 37.7, -122.1, 37.9]));
         assert_eq!(source.discovered_assets().len(), 2);
         let tile = source.get_tile(10, 163, 395).await.unwrap().unwrap();
         assert!(tile.data.starts_with(&[0x89, b'P', b'N', b'G']));
@@ -2310,6 +2571,194 @@ mod mock_api_tests {
             "links": [{ "rel": "next", "href": "https://stac.example.org/search" }]
         });
         assert_eq!(next_page_token(&body), None);
+    }
+
+    // ---- `datetime` knob (C1) ----
+
+    fn asset_at(id: &str, bbox: [f64; 4]) -> StacAsset {
+        StacAsset {
+            id: id.to_string(),
+            href: "https://cdn.example/a.tif".to_string(),
+            bbox,
+            title: id.to_string(),
+            datetime: Some("2024-01-01T00:00:00Z".to_string()),
+            cloud_cover: None,
+        }
+    }
+
+    #[test]
+    fn datetime_accepts_z_instant_verbatim() {
+        assert_eq!(
+            parse_datetime_instant("2024-01-01T00:00:00Z").unwrap(),
+            "2024-01-01T00:00:00Z"
+        );
+        // Surrounding whitespace from a config edit is not meaningful.
+        assert_eq!(
+            parse_datetime_instant(" 2024-06-15T12:00:00Z ").unwrap(),
+            "2024-06-15T12:00:00Z"
+        );
+    }
+
+    #[test]
+    fn datetime_accepts_offset_and_fractional_instant() {
+        // No date arithmetic: the value is passed through and the STAC API is
+        // the authority on whether it matches anything.
+        assert_eq!(
+            parse_datetime_instant("2024-06-15T14:00:00+02:00").unwrap(),
+            "2024-06-15T14:00:00+02:00"
+        );
+        assert_eq!(
+            parse_datetime_instant("2024-12-31T23:59:59.995Z").unwrap(),
+            "2024-12-31T23:59:59.995Z"
+        );
+    }
+
+    #[test]
+    fn datetime_rejects_intervals() {
+        for bad in [
+            "2024-01-01T00:00:00Z/2024-12-31T23:59:59Z",
+            "2023-01-01T00:00:00Z/2024-12-31T23:59:59Z",
+            "2024-01-01T00:00:00Z/2024-01-01T00:00:00Z",
+            "../..",
+            "2024-01-01T00:00:00Z/..",
+            "../2024-01-01T00:00:00Z",
+        ] {
+            let err = parse_datetime_instant(bad).unwrap_err().to_string();
+            assert!(err.contains("interval"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn datetime_rejects_non_instants() {
+        for bad in [
+            "",
+            "   ",
+            "2024",
+            "latest",
+            "yesterday",
+            "2024-01-01",
+            "2024-01-01T00:00:00",
+        ] {
+            assert!(
+                parse_datetime_instant(bad).is_err(),
+                "{bad:?} must not parse as an instant"
+            );
+        }
+    }
+
+    #[test]
+    fn multiplicity_rejects_two_items_on_one_footprint() {
+        let bbox = [-122.5, 37.7, -122.3, 37.9];
+        let assets = vec![asset_at("a", bbox), asset_at("b", bbox)];
+        let err = validate_single_item_per_footprint(&assets, "sentinel", None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("2 items for one footprint"), "{err}");
+        assert!(err.contains("time-series"), "{err}");
+        assert!(err.contains("`datetime`"), "{err}");
+    }
+
+    #[test]
+    fn multiplicity_allows_distinct_footprints() {
+        let assets = vec![
+            asset_at("a", [-122.5, 37.7, -122.3, 37.9]),
+            asset_at("b", [-122.3, 37.7, -122.1, 37.9]),
+        ];
+        assert!(validate_single_item_per_footprint(&assets, "sentinel", None).is_ok());
+    }
+
+    #[test]
+    fn multiplicity_allows_empty_result() {
+        // Ocean bboxes are legitimately empty; only multiplicity is fatal.
+        assert!(validate_single_item_per_footprint(&[], "sentinel", None).is_ok());
+    }
+
+    #[test]
+    fn multiplicity_pinned_message_blames_the_provider() {
+        let bbox = [-122.5, 37.7, -122.3, 37.9];
+        let assets = vec![asset_at("a", bbox), asset_at("b", bbox)];
+        let err =
+            validate_single_item_per_footprint(&assets, "sentinel", Some("2024-01-01T00:00:00Z"))
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("overlapping items for one instant"), "{err}");
+        assert!(!err.contains("set `datetime`"), "{err}");
+    }
+
+    #[test]
+    fn search_cache_key_separates_datetimes() {
+        let bbox = [11.2, 47.9, 11.9, 48.4];
+        let k = |dt: Option<&str>| search_cache_key("api", "c", "visual", 50, 64, bbox, dt);
+        assert_ne!(
+            k(Some("2023-01-01T00:00:00Z")),
+            k(Some("2024-01-01T00:00:00Z"))
+        );
+        assert_ne!(k(Some("2024-01-01T00:00:00Z")), k(None));
+        assert_eq!(
+            k(Some("2024-01-01T00:00:00Z")),
+            k(Some("2024-01-01T00:00:00Z"))
+        );
+    }
+
+    #[tokio::test]
+    async fn search_body_carries_datetime_when_pinned() {
+        let (base, requests) = mock_api().await;
+        let _ = discover_assets(
+            &format!("{base}/one"),
+            "c",
+            "role",
+            10,
+            Some([1.0, 2.0, 3.0, 4.0]),
+            Some("2024-01-01T00:00:00Z"),
+        )
+        .await
+        .expect("search ok");
+        let sent = requests
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("one request logged");
+        assert_eq!(sent["datetime"], "2024-01-01T00:00:00Z");
+        assert!(!sent["datetime"].as_str().unwrap().contains('/'));
+    }
+
+    #[tokio::test]
+    async fn search_body_omits_datetime_when_unset() {
+        let (base, requests) = mock_api().await;
+        let _ = discover_assets(&format!("{base}/one"), "c", "role", 10, None, None)
+            .await
+            .expect("search ok");
+        let sent = requests.lock().unwrap().last().cloned().expect("logged");
+        assert!(sent.get("datetime").is_none(), "{sent}");
+    }
+
+    #[tokio::test]
+    async fn new_rejects_an_interval_datetime() {
+        let (base, _) = mock_api().await;
+        let cfg: SourceConfig = toml::from_str(&format!(
+            "id = \"s2\"\ntype = \"stac\"\npath = \"{base}/one\"\ncollection = \"sentinel\"\n\
+             dynamic = true\ndatetime = \"2023-01-01T00:00:00Z/2024-12-31T23:59:59Z\"\n"
+        ))
+        .unwrap();
+        let err = StacSource::new(&cfg).await.err().unwrap().to_string();
+        assert!(err.contains("interval"), "{err}");
+        assert!(err.contains("source 's2'"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn new_rejects_a_time_series_fixture_at_startup() {
+        // Two items, one footprint: the global STAC contract, exercised through
+        // the real construction path rather than the helper alone.
+        let (base, _) = mock_api().await;
+        let err = StacSource::new(&config(&format!("{base}/dupe"), false))
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("one item per footprint"), "{err}");
+        assert!(err.contains("time-series"), "{err}");
+        assert!(err.contains("source 's2'"), "{err}");
     }
 
     #[test]
