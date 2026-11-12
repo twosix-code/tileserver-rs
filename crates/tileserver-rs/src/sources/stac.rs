@@ -275,13 +275,19 @@ impl StacSource {
         }
 
         let bbox = tile_to_wgs84_bbox(z, x, y);
+        // Query with a slightly padded bbox: provider footprints under-report
+        // the pixels their COGs actually hold at supercell edges, so an exact
+        // tile bbox drops a genuine contributor and leaves a horizontal band
+        // of void (see SEARCH_BBOX_PAD_DEG). Ranking and rendering below still
+        // use the true `bbox`.
+        let search_bbox = pad_search_bbox(bbox);
         let assets = match discover_assets_by_bbox(
             &cfg.api_url,
             &cfg.collection,
             &cfg.asset_role,
             cfg.max_items,
             cfg.max_total_items,
-            bbox,
+            search_bbox,
             cfg.datetime.as_deref(),
         )
         .await
@@ -331,7 +337,12 @@ impl StacSource {
         // mosaic keeps the live handle count bounded without enlarging the
         // cache. Assets are ranked most-relevant-first before truncating.
         if cfg.mosaic_max_assets > 0 && candidates.len() > cfg.mosaic_max_assets {
-            let capped = rank_assets_for_tile(&candidates, bbox, cfg.mosaic_max_assets);
+            // Rank against the PADDED bbox: a contributor whose declared
+            // footprint falls just short of the tile edge has zero intersection
+            // with the true bbox, so ranking on the true bbox would discard the
+            // exact neighbour the padding went to fetch. Rendering still uses
+            // the true `bbox` below.
+            let capped = rank_assets_for_tile(&candidates, search_bbox, cfg.mosaic_max_assets);
             tracing::debug!(
                 z,
                 x,
@@ -353,6 +364,39 @@ impl StacSource {
 
         composite_mosaic(&candidates, &cfg.template, z, x, y).await
     }
+}
+
+/// Padding applied to the tile bbox before the upstream `/search`, in degrees.
+///
+/// Provider item bboxes are DECLARED envelopes and under-report the pixels a
+/// COG actually contains at supercell boundaries. Measured on
+/// `io-10m-annual-lulc` at the 48°N UTM latitude-band boundary (2026-11-12):
+///
+///   - `33T-2024` declares its north edge at lat 47.98783, but its pixels
+///     reach 48.00009 (raw COG scan, colormap, nodata transparent);
+///   - `33U-2024` declares its south edge at 47.96096, but its pixels only
+///     start at 47.99980.
+///
+/// A tile spanning 47.9899..48.0046 therefore matches `33U` alone, because
+/// `33T`'s declared bbox stops 0.002° short of the tile edge and bbox
+/// intersection drops it. The strip 47.9899..48.000 that `33T` really covers
+/// renders transparent: a full-width horizontal band that WIDENS with zoom,
+/// since the same ~0.01° sliver maps to more pixels at every level.
+///
+/// Only the search bbox is padded — ranking and rendering still use the true
+/// tile bbox, so this can pull in extra candidates but can never enlarge the
+/// rendered area (a contributor with no real pixels there stays transparent).
+const SEARCH_BBOX_PAD_DEG: f64 = 0.02;
+
+/// Expand a search bbox by [`SEARCH_BBOX_PAD_DEG`], clamped to valid WGS-84.
+#[must_use]
+fn pad_search_bbox(bbox: [f64; 4]) -> [f64; 4] {
+    [
+        (bbox[0] - SEARCH_BBOX_PAD_DEG).max(-180.0),
+        (bbox[1] - SEARCH_BBOX_PAD_DEG).max(-90.0),
+        (bbox[2] + SEARCH_BBOX_PAD_DEG).min(180.0),
+        (bbox[3] + SEARCH_BBOX_PAD_DEG).min(90.0),
+    ]
 }
 
 /// Discover COG assets from a STAC API catalog.
@@ -2902,6 +2946,61 @@ mod mock_api_tests {
         let mut ids: Vec<String> = capped.into_iter().map(|a| a.id).collect();
         ids.sort();
         assert_eq!(ids, vec!["a0", "b0"], "both cells survive the cap");
+    }
+
+    // ---- search-bbox padding: under-reported provider footprints ----
+
+    #[test]
+    fn pad_bbox_expands_by_the_pad_on_every_side() {
+        let b = [11.9531, 47.9899, 12.3047, 48.2247];
+        let p = pad_search_bbox(b);
+        assert!((p[0] - (b[0] - SEARCH_BBOX_PAD_DEG)).abs() < 1e-12);
+        assert!((p[1] - (b[1] - SEARCH_BBOX_PAD_DEG)).abs() < 1e-12);
+        assert!((p[2] - (b[2] + SEARCH_BBOX_PAD_DEG)).abs() < 1e-12);
+        assert!((p[3] - (b[3] + SEARCH_BBOX_PAD_DEG)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn pad_bbox_clamps_to_valid_wgs84() {
+        // A tile at the antimeridian / pole must not produce an out-of-range
+        // bbox that the STAC API would reject.
+        let p = pad_search_bbox([-180.0, -90.0, 180.0, 90.0]);
+        assert_eq!(p, [-180.0, -90.0, 180.0, 90.0]);
+    }
+
+    /// The reported regression (measured 2026-11-12, `io-lulc` at 48°N).
+    ///
+    /// `33T-2024` DECLARES its north edge at 47.98773 but its pixels actually
+    /// reach 48.00009. A tile spanning 47.9899..48.0046 therefore has ZERO
+    /// intersection with 33T's declared footprint, so the exact-bbox search
+    /// and the ranker both drop it — leaving a full-width transparent band
+    /// that widens with zoom. Padding the SEARCH bbox recovers the item.
+    #[test]
+    fn pad_recovers_a_footprint_that_falls_just_short_of_the_tile_edge() {
+        let tile = [11.9531, 47.9899, 12.3047, 48.2247];
+        // 33T-2024's declared footprint (north edge 0.0022 short of the tile).
+        let t33 = [5.5675524, 39.9612323, 12.4324476, 47.9877374];
+        // 33U-2024 fully covers the tile.
+        let u33 = [5.4126704, 47.9609557, 12.5873296, 55.9842837];
+
+        assert_eq!(
+            bbox_intersection_area(t33, tile),
+            0.0,
+            "the under-reported footprint misses the true tile bbox entirely"
+        );
+        assert!(
+            bbox_intersection_area(t33, pad_search_bbox(tile)) > 0.0,
+            "padding the search bbox recovers the contributor"
+        );
+
+        // With the cap binding, ranking on the TRUE bbox would discard 33T
+        // again (0 intersection), silently undoing the fix.
+        let both = vec![asset_at("u33", u33), asset_at("t33", t33)];
+        let on_true = rank_assets_for_tile(&both, tile, 8);
+        assert_eq!(on_true.len(), 1, "true bbox drops 33T");
+
+        let on_padded = rank_assets_for_tile(&both, pad_search_bbox(tile), 8);
+        assert_eq!(on_padded.len(), 2, "padded bbox keeps both contributors");
     }
 
     // ---- zoom window enforcement (C3) ----
