@@ -294,6 +294,24 @@ impl StacSource {
             return Ok(None);
         }
 
+        // Defensive invariant: one candidate per distinct footprint before the
+        // cap. A no-op when `datetime` is pinned and the startup probe passed
+        // (the /search already returns one item per place); load-bearing only
+        // for footprints the probe could not see (outside `stac_bbox`) or
+        // providers that republish overlapping items after startup.
+        let candidates = dedupe_by_footprint(&assets);
+        if candidates.len() < assets.len() {
+            tracing::debug!(
+                z,
+                x,
+                y,
+                before = assets.len(),
+                after = candidates.len(),
+                "footprint dedupe collapsed duplicates (footprint outside the probed \
+                 bbox, or provider republishing?)"
+            );
+        }
+
         // Fan-out cap: bound how many assets a single tile opens and renders.
         // Each open COG handle is charged a flat 16 MiB against the dataset
         // budget, and a low-zoom tile's bbox can match dozens of items (a z6
@@ -302,13 +320,13 @@ impl StacSource {
         // renders blank — which reads as "the server went down". Capping the
         // mosaic keeps the live handle count bounded without enlarging the
         // cache. Assets are ranked most-relevant-first before truncating.
-        if cfg.mosaic_max_assets > 0 && assets.len() > cfg.mosaic_max_assets {
-            let capped = rank_assets_for_tile(&assets, bbox, cfg.mosaic_max_assets);
+        if cfg.mosaic_max_assets > 0 && candidates.len() > cfg.mosaic_max_assets {
+            let capped = rank_assets_for_tile(&candidates, bbox, cfg.mosaic_max_assets);
             tracing::debug!(
                 z,
                 x,
                 y,
-                candidates = assets.len(),
+                candidates = candidates.len(),
                 kept = capped.len(),
                 cap = cfg.mosaic_max_assets,
                 "mosaic fan-out capped"
@@ -319,11 +337,11 @@ impl StacSource {
             return composite_mosaic(&capped, &cfg.template, z, x, y).await;
         }
 
-        if assets.len() == 1 {
-            return render_single_asset(&assets[0], &cfg.template, z, x, y).await;
+        if candidates.len() == 1 {
+            return render_single_asset(&candidates[0], &cfg.template, z, x, y).await;
         }
 
-        composite_mosaic(&assets, &cfg.template, z, x, y).await
+        composite_mosaic(&candidates, &cfg.template, z, x, y).await
     }
 }
 
@@ -921,6 +939,38 @@ fn looks_like_rfc3339_instant(s: &str) -> bool {
 /// byte-identical between this startup check and `dedupe_by_footprint`.
 fn footprint_key(bbox: [f64; 4]) -> [u64; 4] {
     bbox.map(f64::to_bits)
+}
+
+/// Collapse assets that describe the same footprint into one candidate.
+///
+/// Grouping is by exact bbox equality (via [`footprint_key`], the same key the
+/// startup probe uses): republished timesteps carry byte-identical bboxes, and
+/// exact equality keeps grouping transitive — the dedupe is idempotent by
+/// construction. A tolerance (`|a-b| <= eps`) is deliberately not used: it is
+/// not transitive, so a second pass could still merge, and over-collapsing
+/// distinct cells produces permanent holes.
+///
+/// The survivor is the FIRST occurrence in input order: deterministic,
+/// preserves the upstream ranking that `pixel_selection = "first"` renders
+/// topmost, and with a pinned datetime there is at most one item per footprint
+/// in practice anyway. Render-time reordering (`order_assets_for_method`,
+/// `lowest_cloud_cover`) is unaffected.
+///
+/// This is a **selection filter**: it returns a subsequence of its input where
+/// at most one candidate survives per distinct footprint. Nothing is merged,
+/// resampled or invented, so `|out| <= |in|` always.
+#[must_use]
+fn dedupe_by_footprint(assets: &[StacAsset]) -> Vec<StacAsset> {
+    let mut seen: Vec<[u64; 4]> = Vec::new();
+    let mut out: Vec<StacAsset> = Vec::new();
+    for asset in assets {
+        let key = footprint_key(asset.bbox);
+        if !seen.contains(&key) {
+            seen.push(key);
+            out.push(asset.clone());
+        }
+    }
+    out
 }
 
 /// Validate the global STAC contract: **one item per footprint**.
@@ -2759,6 +2809,89 @@ mod mock_api_tests {
         assert!(err.contains("one item per footprint"), "{err}");
         assert!(err.contains("time-series"), "{err}");
         assert!(err.contains("source 's2'"), "{err}");
+    }
+
+    // ---- `dedupe_by_footprint` runtime invariant (C2) ----
+
+    /// `n` copies of one footprint, ids suffixed so a survivor is identifiable.
+    fn copies(id: &str, bbox: [f64; 4], n: usize) -> Vec<StacAsset> {
+        (0..n)
+            .map(|i| asset_at(&format!("{id}{i}"), bbox))
+            .collect()
+    }
+
+    #[test]
+    fn dedupe_collapses_identical_footprints_keeping_first() {
+        let bbox = [-122.5, 37.7, -122.3, 37.9];
+        let out = dedupe_by_footprint(&copies("a", bbox, 8));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, "a0", "the first occurrence survives");
+    }
+
+    #[test]
+    fn dedupe_keeps_distinct_supercells() {
+        // Over-collapsing is the failure worse than duplicates: two UTM cells
+        // with 8 vintages each must stay two candidates, not one.
+        let mut assets = copies("a", [-122.5, 37.7, -122.3, 37.9], 8);
+        assets.extend(copies("b", [-122.3, 37.7, -122.1, 37.9], 8));
+        assert_eq!(dedupe_by_footprint(&assets).len(), 2);
+    }
+
+    #[test]
+    fn dedupe_preserves_first_seen_order() {
+        let a = [-122.5, 37.7, -122.3, 37.9];
+        let b = [-122.3, 37.7, -122.1, 37.9];
+        let mut assets = Vec::new();
+        for i in 0..4 {
+            assets.push(asset_at(&format!("a{i}"), a));
+            assets.push(asset_at(&format!("b{i}"), b));
+        }
+        let ids: Vec<String> = dedupe_by_footprint(&assets)
+            .into_iter()
+            .map(|a| a.id)
+            .collect();
+        assert_eq!(ids, vec!["a0", "b0"]);
+    }
+
+    #[test]
+    fn dedupe_is_idempotent() {
+        // Exact equality is transitive, so the second pass is a no-op. A
+        // tolerance would fail this — which is why there is none.
+        let mut assets = copies("a", [-122.5, 37.7, -122.3, 37.9], 8);
+        assets.extend(copies("b", [-122.3, 37.7, -122.1, 37.9], 8));
+        let once = dedupe_by_footprint(&assets);
+        let twice = dedupe_by_footprint(&once);
+        let ids = |v: &[StacAsset]| v.iter().map(|a| a.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&twice), ids(&once));
+        assert_eq!(twice.len(), once.len());
+    }
+
+    #[test]
+    fn dedupe_handles_empty_and_single() {
+        assert!(dedupe_by_footprint(&[]).is_empty());
+        let one = copies("a", [-122.5, 37.7, -122.3, 37.9], 1);
+        let out = dedupe_by_footprint(&one);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, "a0");
+    }
+
+    #[test]
+    fn cap_applies_after_dedupe() {
+        // The degenerate-path safety net: 2 supercells x 8 timesteps with
+        // cap 8 collapses to the 2 real places, not one place's history.
+        let tile = [-122.5, 37.7, -122.1, 37.9];
+        let mut assets = copies("a", [-122.5, 37.7, -122.3, 37.9], 8);
+        assets.extend(copies("b", [-122.3, 37.7, -122.1, 37.9], 8));
+        assert_eq!(
+            rank_assets_for_tile(&assets, tile, 8).len(),
+            8,
+            "the raw cap is consumed by one footprint's history"
+        );
+        let capped = rank_assets_for_tile(&dedupe_by_footprint(&assets), tile, 8);
+        assert_eq!(capped.len(), 2);
+        let mut ids: Vec<String> = capped.into_iter().map(|a| a.id).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["a0", "b0"], "both cells survive the cap");
     }
 
     #[test]
