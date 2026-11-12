@@ -264,6 +264,16 @@ impl StacSource {
         x: u32,
         y: u32,
     ) -> Result<Option<TileData>> {
+        // Honour the source's declared zoom window. Without this guard `minzoom`
+        // is TileJSON-advisory only and a non-conforming client can drive a z0
+        // request into a full continental fan-out. Post-pinning the worst case
+        // is bounded (budget + 2xCPU one-shot opens): a latency and
+        // upstream-load problem, not a memory cliff — but still not a request
+        // we should serve.
+        if z < self.metadata.minzoom || z > self.metadata.maxzoom {
+            return Ok(None);
+        }
+
         let bbox = tile_to_wgs84_bbox(z, x, y);
         let assets = match discover_assets_by_bbox(
             &cfg.api_url,
@@ -2892,6 +2902,43 @@ mod mock_api_tests {
         let mut ids: Vec<String> = capped.into_iter().map(|a| a.id).collect();
         ids.sort();
         assert_eq!(ids, vec!["a0", "b0"], "both cells survive the cap");
+    }
+
+    // ---- zoom window enforcement (C3) ----
+
+    fn config_with_zoom(api: &str, minzoom: u8, maxzoom: u8) -> SourceConfig {
+        let mut cfg = config(api, true);
+        cfg.minzoom = Some(minzoom);
+        cfg.maxzoom = Some(maxzoom);
+        cfg
+    }
+
+    #[tokio::test]
+    async fn dynamic_tile_below_minzoom_returns_none_without_search() {
+        let (base, requests) = mock_api().await;
+        let source = StacSource::new(&config_with_zoom(&format!("{base}/one"), 3, 18))
+            .await
+            .unwrap();
+        // Construction runs the startup probe; only per-tile requests matter.
+        requests.lock().unwrap().clear();
+
+        assert!(source.get_tile(2, 1, 1).await.unwrap().is_none());
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "the zoom guard fires before discovery — no /search may be sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_tile_above_maxzoom_returns_none_without_search() {
+        let (base, requests) = mock_api().await;
+        let source = StacSource::new(&config_with_zoom(&format!("{base}/one"), 0, 14))
+            .await
+            .unwrap();
+        requests.lock().unwrap().clear();
+
+        assert!(source.get_tile(15, 1, 1).await.unwrap().is_none());
+        assert!(requests.lock().unwrap().is_empty(), "no /search for z15");
     }
 
     #[test]
